@@ -10,6 +10,7 @@
       * показывает таблицу |№|Дата|Имя|Хэш| (плюс компьютер и путь) и хранит историю в SQLite;
       * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO.
 
+    Скрипт самодостаточный (один файл). Драйвер SQLite скачивается при первом запуске.
     Подробности и требования - в README.md.
 
 .PARAMETER DbPath
@@ -31,9 +32,637 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.Apartme
 $script:AppRoot = $PSScriptRoot
 if (-not $DbPath) { $DbPath = Join-Path $script:AppRoot 'data\processes.db' }
 
-. (Join-Path $script:AppRoot 'src\Database.ps1')
-. (Join-Path $script:AppRoot 'src\Collector.ps1')
-. (Join-Path $script:AppRoot 'src\Blocker.ps1')
+# ===========================================================================
+# Хранилище SQLite
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Драйвер SQLite: System.Data.SQLite скачивается с nuget.org при первом запуске
+# ---------------------------------------------------------------------------
+
+function Install-SQLiteDriver {
+    param(
+        [string]$Version = '1.0.118',
+        [string]$Framework = 'net45'    # работает везде, где есть PowerShell 5.1
+    )
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $target = Join-Path $script:AppRoot 'lib\sqlite'
+    $package = Join-Path ([IO.Path]::GetTempPath()) ('sqlite-{0}.nupkg' -f [Guid]::NewGuid().ToString('N'))
+    $id = 'stub.system.data.sqlite.core.netframework'
+    $url = 'https://api.nuget.org/v3-flatcontainer/{0}/{1}/{0}.{1}.nupkg' -f $id, $Version
+    $files = @{
+        ('lib/{0}/System.Data.SQLite.dll' -f $Framework)   = 'System.Data.SQLite.dll'
+        ('build/{0}/x64/SQLite.Interop.dll' -f $Framework) = 'x64\SQLite.Interop.dll'
+        ('build/{0}/x86/SQLite.Interop.dll' -f $Framework) = 'x86\SQLite.Interop.dll'
+    }
+
+    Invoke-WebRequest -Uri $url -OutFile $package -UseBasicParsing
+    $extracted = 0
+    $zip = [IO.Compression.ZipFile]::OpenRead($package)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if (-not $files.ContainsKey($entry.FullName)) { continue }
+            $dest = Join-Path $target $files[$entry.FullName]
+            $destDir = Split-Path -Parent $dest
+            if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir | Out-Null }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+            $extracted++
+        }
+    }
+    finally {
+        $zip.Dispose()
+        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
+    }
+    if ($extracted -ne $files.Count) {
+        throw "В пакете $url найдено файлов: $extracted из $($files.Count)."
+    }
+}
+
+# Хранилище SQLite: результаты сканирований и журнал блокировок.
+# Требует $script:AppRoot (папка приложения) и lib\sqlite\System.Data.SQLite.dll.
+
+$script:DbPath = $null
+$script:SQLiteLoaded = $false
+
+function Import-SQLite {
+    if ($script:SQLiteLoaded) { return }
+    $dll = Join-Path $script:AppRoot 'lib\sqlite\System.Data.SQLite.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            "Не найден драйвер SQLite:`n$dll`n`nСкачать System.Data.SQLite с nuget.org сейчас?",
+            'Process Monitor', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
+            throw "Драйвер SQLite не установлен. Положите System.Data.SQLite.dll (+ x64\x86 SQLite.Interop.dll) в $(Split-Path -Parent $dll)."
+        }
+        Install-SQLiteDriver
+    }
+    Add-Type -Path $dll
+    $script:SQLiteLoaded = $true
+}
+
+function Open-Db {
+    $conn = New-Object System.Data.SQLite.SQLiteConnection("Data Source=$($script:DbPath);Version=3;")
+    $conn.Open()
+    return $conn
+}
+
+function Add-DbParameters {
+    param($Command, [hashtable]$Params)
+    if (-not $Params) { return }
+    foreach ($key in $Params.Keys) {
+        $value = $Params[$key]
+        if ($null -eq $value) { $value = [DBNull]::Value }
+        [void]$Command.Parameters.AddWithValue("@$key", $value)
+    }
+}
+
+function Invoke-DbNonQuery {
+    param(
+        [Parameter(Mandatory)][string]$Sql,
+        [hashtable]$Params,
+        [object]$Connection
+    )
+    $own = -not $Connection
+    if ($own) { $Connection = Open-Db }
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = $Sql
+        Add-DbParameters -Command $cmd -Params $Params
+        return $cmd.ExecuteNonQuery()
+    }
+    finally {
+        if ($own) { $Connection.Dispose() }
+    }
+}
+
+function Invoke-DbScalar {
+    param(
+        [Parameter(Mandatory)][string]$Sql,
+        [hashtable]$Params,
+        [object]$Connection
+    )
+    $own = -not $Connection
+    if ($own) { $Connection = Open-Db }
+    try {
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = $Sql
+        Add-DbParameters -Command $cmd -Params $Params
+        return $cmd.ExecuteScalar()
+    }
+    finally {
+        if ($own) { $Connection.Dispose() }
+    }
+}
+
+function Invoke-DbQuery {
+    param(
+        [Parameter(Mandatory)][string]$Sql,
+        [hashtable]$Params
+    )
+    $conn = Open-Db
+    try {
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = $Sql
+        Add-DbParameters -Command $cmd -Params $Params
+        $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd)
+        $table = New-Object System.Data.DataTable
+        [void]$adapter.Fill($table)
+        return , $table
+    }
+    finally {
+        $conn.Dispose()
+    }
+}
+
+function Initialize-Database {
+    param([Parameter(Mandatory)][string]$Path)
+
+    Import-SQLite
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir | Out-Null
+    }
+    $script:DbPath = $Path
+
+    $schema = @(
+        'CREATE TABLE IF NOT EXISTS Scans (
+            Id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ScanDate  TEXT    NOT NULL,
+            Requested INTEGER NOT NULL DEFAULT 0,
+            Succeeded INTEGER NOT NULL DEFAULT 0,
+            Failed    INTEGER NOT NULL DEFAULT 0
+        )',
+        'CREATE TABLE IF NOT EXISTS Processes (
+            Id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ScanId   INTEGER NOT NULL REFERENCES Scans(Id),
+            ScanDate TEXT    NOT NULL,
+            Computer TEXT    NOT NULL,
+            Name     TEXT    NOT NULL,
+            Path     TEXT,
+            Size     INTEGER,
+            MD5      TEXT,
+            SHA1     TEXT,
+            SHA256   TEXT
+        )',
+        'CREATE INDEX IF NOT EXISTS IX_Processes_Scan     ON Processes (ScanId)',
+        'CREATE INDEX IF NOT EXISTS IX_Processes_Computer ON Processes (Computer, ScanId)',
+        'CREATE INDEX IF NOT EXISTS IX_Processes_MD5      ON Processes (MD5)',
+        'CREATE INDEX IF NOT EXISTS IX_Processes_SHA1     ON Processes (SHA1)',
+        'CREATE INDEX IF NOT EXISTS IX_Processes_SHA256   ON Processes (SHA256)',
+        'CREATE TABLE IF NOT EXISTS Blocks (
+            Id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            BlockDate TEXT    NOT NULL,
+            Name      TEXT,
+            Algorithm TEXT    NOT NULL,
+            Hash      TEXT    NOT NULL,
+            Size      INTEGER,
+            GpoName   TEXT    NOT NULL,
+            RuleId    TEXT    NOT NULL,
+            Active    INTEGER NOT NULL DEFAULT 1
+        )'
+    )
+    $conn = Open-Db
+    try {
+        foreach ($sql in $schema) {
+            [void](Invoke-DbNonQuery -Sql $sql -Connection $conn)
+        }
+    }
+    finally {
+        $conn.Dispose()
+    }
+}
+
+# ---- Сканирования и процессы -------------------------------------------------
+
+function New-Scan {
+    param([int]$Requested)
+    $date = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $conn = Open-Db
+    try {
+        [void](Invoke-DbNonQuery -Connection $conn -Params @{ d = $date; r = $Requested } `
+            -Sql 'INSERT INTO Scans (ScanDate, Requested) VALUES (@d, @r)')
+        $id = [int](Invoke-DbScalar -Connection $conn -Sql 'SELECT last_insert_rowid()')
+    }
+    finally {
+        $conn.Dispose()
+    }
+    return [pscustomobject]@{ Id = $id; Date = $date }
+}
+
+function Save-Processes {
+    param(
+        [Parameter(Mandatory)][int]$ScanId,
+        [Parameter(Mandatory)][string]$ScanDate,
+        [object[]]$Rows,
+        [int]$Succeeded,
+        [int]$Failed
+    )
+    $conn = Open-Db
+    try {
+        $tx = $conn.BeginTransaction()
+        try {
+            $cmd = $conn.CreateCommand()
+            $cmd.Transaction = $tx
+            $cmd.CommandText = 'INSERT INTO Processes (ScanId, ScanDate, Computer, Name, Path, Size, MD5, SHA1, SHA256)
+                                VALUES (@scan, @date, @comp, @name, @path, @size, @md5, @sha1, @sha256)'
+            $p = @{}
+            foreach ($n in 'scan', 'date', 'comp', 'name', 'path', 'size', 'md5', 'sha1', 'sha256') {
+                $p[$n] = $cmd.Parameters.AddWithValue("@$n", [DBNull]::Value)
+            }
+            foreach ($r in $Rows) {
+                $p.scan.Value = $ScanId
+                $p.date.Value = $ScanDate
+                $p.comp.Value = ([string]$r.Computer).ToUpper()
+                $p.name.Value = [string]$r.Name
+                $p.path.Value = [string]$r.Path
+                $p.size.Value = [long]$r.Size
+                $p.md5.Value = ([string]$r.MD5).ToUpper()
+                $p.sha1.Value = ([string]$r.SHA1).ToUpper()
+                $p.sha256.Value = ([string]$r.SHA256).ToUpper()
+                [void]$cmd.ExecuteNonQuery()
+            }
+            [void](Invoke-DbNonQuery -Connection $conn -Params @{ id = $ScanId; ok = $Succeeded; bad = $Failed } `
+                -Sql 'UPDATE Scans SET Succeeded = @ok, Failed = @bad WHERE Id = @id')
+            $tx.Commit()
+        }
+        catch {
+            $tx.Rollback()
+            throw
+        }
+    }
+    finally {
+        $conn.Dispose()
+    }
+}
+
+function Get-Scans {
+    Invoke-DbQuery -Sql "SELECT Id,
+            ScanDate || '  (ПК: ' || Succeeded || ' из ' || Requested || ')' AS Title
+        FROM Scans ORDER BY Id DESC"
+}
+
+function Get-ProcessTable {
+    param(
+        [int]$ScanId = 0,
+        [ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm = 'MD5'
+    )
+    # $Algorithm прошёл ValidateSet, поэтому подставлять его в SQL безопасно.
+    $sql = "SELECT ScanDate, Name, $Algorithm AS Hash, Computer, Path, Size FROM Processes"
+    $params = @{}
+    if ($ScanId -gt 0) {
+        $sql += ' WHERE ScanId = @scan'
+        $params.scan = $ScanId
+    }
+    $sql += ' ORDER BY ScanDate DESC, Computer, Name'
+    Invoke-DbQuery -Sql $sql -Params $params
+}
+
+# Где хэш встречался в последнем сканировании каждого компьютера.
+function Get-HashLocations {
+    param(
+        [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
+        [Parameter(Mandatory)][string]$Hash
+    )
+    Invoke-DbQuery -Params @{ h = $Hash.ToUpper() } -Sql "SELECT DISTINCT p.Computer, p.Path FROM Processes p
+        WHERE p.$Algorithm = @h
+          AND p.ScanId = (SELECT MAX(ScanId) FROM Processes WHERE Computer = p.Computer)"
+}
+
+# ---- Блокировки ------------------------------------------------------------
+
+function Add-BlockRecord {
+    param(
+        [string]$Name,
+        [Parameter(Mandatory)][string]$Algorithm,
+        [Parameter(Mandatory)][string]$Hash,
+        [long]$Size,
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][string]$RuleId
+    )
+    [void](Invoke-DbNonQuery -Params @{
+            d = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); n = $Name; a = $Algorithm
+            h = $Hash.ToUpper(); s = $Size; g = $GpoName; r = $RuleId
+        } -Sql 'INSERT INTO Blocks (BlockDate, Name, Algorithm, Hash, Size, GpoName, RuleId)
+                VALUES (@d, @n, @a, @h, @s, @g, @r)')
+}
+
+function Get-BlockTable {
+    Invoke-DbQuery -Sql "SELECT Id, BlockDate, Name, Algorithm, Hash, GpoName, RuleId, Active,
+            CASE Active WHEN 1 THEN 'Активна' ELSE 'Снята' END AS Status
+        FROM Blocks ORDER BY Id DESC"
+}
+
+function Get-ActiveBlock {
+    param([string]$Algorithm, [string]$Hash)
+    $t = Invoke-DbQuery -Params @{ a = $Algorithm; h = $Hash.ToUpper() } `
+        -Sql 'SELECT * FROM Blocks WHERE Active = 1 AND Algorithm = @a AND Hash = @h LIMIT 1'
+    if ($t.Rows.Count -gt 0) { return $t.Rows[0] }
+    return $null
+}
+
+function Disable-BlockRecord {
+    param([Parameter(Mandatory)][int]$Id)
+    [void](Invoke-DbNonQuery -Params @{ id = $Id } -Sql 'UPDATE Blocks SET Active = 0 WHERE Id = @id')
+}
+
+# ===========================================================================
+# Компьютеры AD и удалённый сбор
+# ===========================================================================
+
+# Список компьютеров из AD и удалённый сбор запущенных процессов через WinRM.
+
+# Компьютеры домена через ADSI: не требует модуля ActiveDirectory (RSAT),
+# поэтому работает и на рабочих станциях, и на контроллерах 2008/2012.
+function Get-AdComputers {
+    param([string]$SearchBase)
+
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    if ($SearchBase) {
+        $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$SearchBase")
+    }
+    # Только включённые учётные записи компьютеров с Windows.
+    $searcher.Filter = '(&(objectCategory=computer)(operatingSystem=Windows*)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))'
+    $searcher.PageSize = 1000
+    foreach ($prop in 'name', 'dnshostname', 'operatingsystem') {
+        [void]$searcher.PropertiesToLoad.Add($prop)
+    }
+
+    $results = $searcher.FindAll()
+    try {
+        foreach ($r in $results) {
+            $name = [string]$r.Properties['name'][0]
+            $dns = if ($r.Properties['dnshostname'].Count) { [string]$r.Properties['dnshostname'][0] } else { $name }
+            $os = if ($r.Properties['operatingsystem'].Count) { [string]$r.Properties['operatingsystem'][0] } else { '' }
+            [pscustomobject]@{ Name = $name; Host = $dns; OS = $os }
+        }
+    }
+    finally {
+        $results.Dispose()
+        $searcher.Dispose()
+    }
+}
+
+# Выполняется на удалённом компьютере. Должен работать в PowerShell 2.0
+# (на Windows Server 2008 R2 без WMF 5.1), поэтому только базовый синтаксис.
+$script:CollectScript = {
+    $ErrorActionPreference = 'Stop'
+    $seen = @{}
+    $algs = @{
+        MD5    = [System.Security.Cryptography.MD5]::Create()
+        SHA1   = [System.Security.Cryptography.SHA1]::Create()
+        SHA256 = [System.Security.Cryptography.SHA256]::Create()
+    }
+    $buffer = New-Object byte[] 1048576
+
+    foreach ($proc in (Get-WmiObject -Class Win32_Process)) {
+        $path = $proc.ExecutablePath
+        if (-not $path) { continue }
+        $key = $path.ToLower()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+
+        try {
+            $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                foreach ($a in $algs.Values) { $a.Initialize() }
+                while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    foreach ($a in $algs.Values) { [void]$a.TransformBlock($buffer, 0, $n, $null, 0) }
+                }
+                foreach ($a in $algs.Values) { [void]$a.TransformFinalBlock($buffer, 0, 0) }
+                $size = $stream.Length
+            }
+            finally {
+                $stream.Close()
+            }
+        }
+        catch {
+            continue    # файл недоступен или удалён - пропускаем
+        }
+
+        New-Object PSObject -Property @{
+            Computer = $env:COMPUTERNAME
+            Name     = $proc.Name
+            Path     = $path
+            Size     = $size
+            MD5      = [BitConverter]::ToString($algs.MD5.Hash).Replace('-', '')
+            SHA1     = [BitConverter]::ToString($algs.SHA1.Hash).Replace('-', '')
+            SHA256   = [BitConverter]::ToString($algs.SHA256.Hash).Replace('-', '')
+        }
+    }
+}
+
+# Применить блокировку сразу: gpupdate и завершение уже запущенных экземпляров.
+# $Map: имя компьютера (в верхнем регистре) -> массив путей к файлу.
+$script:ApplyBlockScript = {
+    param($Map)
+    $res = New-Object PSObject -Property @{
+        Computer = $env:COMPUTERNAME
+        GpUpdate = ''
+        Killed   = 0
+        Error    = ''
+    }
+    try {
+        & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $res.GpUpdate = 'OK' } else { $res.GpUpdate = 'код ' + $LASTEXITCODE }
+
+        $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
+        if ($paths.Count -gt 0) {
+            foreach ($p in (Get-WmiObject -Class Win32_Process)) {
+                if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
+                    $r = $p.Terminate()
+                    if ($r.ReturnValue -eq 0) { $res.Killed = $res.Killed + 1 }
+                }
+            }
+        }
+    }
+    catch {
+        $res.Error = $_.Exception.Message
+    }
+    $res
+}
+
+function Get-RemoteSessionOption {
+    New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 900000 -NoMachineProfile
+}
+
+function Start-Collection {
+    param(
+        [Parameter(Mandatory)][string[]]$ComputerName,
+        [int]$ThrottleLimit = 32
+    )
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock $script:CollectScript `
+        -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
+        -AsJob -JobName 'ProcMon-Collect'
+}
+
+function Start-BlockApply {
+    param([Parameter(Mandatory)][hashtable]$Map)
+    Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
+        -ArgumentList (, $Map) -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -AsJob -JobName 'ProcMon-Apply'
+}
+
+# Сколько дочерних заданий (по одному на компьютер) уже завершилось.
+function Get-JobProgress {
+    param([Parameter(Mandatory)]$Job)
+    $children = @($Job.ChildJobs)
+    $done = @($children | Where-Object { $_.State -notin 'Running', 'NotStarted' }).Count
+    [pscustomobject]@{ Done = $done; Total = $children.Count }
+}
+
+# Забирает результат задания: данные успешных компьютеров и причины сбоев остальных.
+function Receive-JobResults {
+    param([Parameter(Mandatory)]$Job)
+
+    $data = New-Object System.Collections.ArrayList
+    $failures = New-Object System.Collections.ArrayList
+    $succeeded = 0
+    foreach ($child in $Job.ChildJobs) {
+        if ($child.State -eq 'Completed') {
+            $succeeded++
+            $items = @(Receive-Job -Job $child -ErrorAction SilentlyContinue)
+            if ($items.Count -gt 0) { $data.AddRange($items) }
+        }
+        else {
+            $reason = $child.JobStateInfo.Reason
+            $message = if ($reason) { ($reason.Message -replace '\s+', ' ').Trim() } else { [string]$child.State }
+            [void]$failures.Add([pscustomobject]@{ Computer = $child.Location; Message = $message })
+        }
+    }
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+    [pscustomobject]@{ Data = $data; Failures = $failures; Succeeded = $succeeded }
+}
+
+# ===========================================================================
+# Блокировка по хэшу (SRP / GPO)
+# ===========================================================================
+
+# Блокировка запуска по хэшу через Software Restriction Policies (SRP) в доменной GPO.
+# Правило пишется в Registry.pol GPO как хэш-правило уровня "Запрещено" (Disallowed):
+#   HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Hashes\{GUID}
+# Требуется модуль GroupPolicy (RSAT: Group Policy Management) на машине администратора.
+
+$script:SrpBase = 'HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
+
+# Идентификаторы алгоритмов (CALG_*), которые SRP хранит в значении HashAlg.
+$script:SrpHashAlg = @{ MD5 = 32771; SHA1 = 32772; SHA256 = 32780 }
+$script:HashLength = @{ MD5 = 32; SHA1 = 40; SHA256 = 64 }
+
+# Типы файлов, которые SRP проверяет по умолчанию.
+$script:SrpExecutableTypes = @(
+    'ADE', 'ADP', 'BAS', 'BAT', 'CHM', 'CMD', 'COM', 'CPL', 'CRT', 'EXE', 'HLP', 'HTA', 'INF', 'INS', 'ISP',
+    'LNK', 'MDB', 'MDE', 'MSC', 'MSI', 'MSP', 'MST', 'OCX', 'PCD', 'PIF', 'REG', 'SCR', 'SHS', 'URL', 'VB', 'WSC'
+)
+
+function Test-GroupPolicyModule {
+    [bool](Get-Module -ListAvailable -Name GroupPolicy)
+}
+
+# Системные файлы Windows блокировать нельзя: правило по хэшу svchost.exe или
+# explorer.exe выведет из строя весь домен.
+function Test-ProtectedPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    return [bool]($Path -match '(?i)^[a-z]:\\windows\\')
+}
+
+function ConvertFrom-HexString {
+    param([Parameter(Mandatory)][string]$Hex)
+    $bytes = New-Object byte[] ($Hex.Length / 2)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        $bytes[$i] = [Convert]::ToByte($Hex.Substring($i * 2, 2), 16)
+    }
+    , $bytes
+}
+
+function Test-HashValue {
+    param([string]$Algorithm, [string]$Hash)
+    return [bool]($Hash -match '^[0-9A-Fa-f]+$' -and $Hash.Length -eq $script:HashLength[$Algorithm])
+}
+
+# Создаёт GPO (если её нет), задаёт базовые параметры SRP и при необходимости
+# привязывает GPO к контейнеру. Существующие значения SRP не перезаписываются.
+function Initialize-SrpGpo {
+    param(
+        [Parameter(Mandatory)][string]$GpoName,
+        [string]$LinkTarget
+    )
+    Import-Module GroupPolicy -ErrorAction Stop
+
+    $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
+    if (-not $gpo) {
+        $gpo = New-GPO -Name $GpoName -Comment 'Блокировка процессов по хэшу (создано ProcessMonitor)' -ErrorAction Stop
+    }
+
+    $hasBase = $true
+    try {
+        [void](Get-GPRegistryValue -Name $GpoName -Key $script:SrpBase -ValueName DefaultLevel -ErrorAction Stop)
+    }
+    catch {
+        $hasBase = $false
+    }
+    if (-not $hasBase) {
+        $base = $script:SrpBase
+        # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
+    }
+
+    if ($LinkTarget) {
+        $linked = (Get-GPInheritance -Target $LinkTarget -ErrorAction Stop).GpoLinks |
+            Where-Object { $_.DisplayName -eq $GpoName }
+        if (-not $linked) {
+            [void](New-GPLink -Name $GpoName -Target $LinkTarget -ErrorAction Stop)
+        }
+    }
+    return $gpo
+}
+
+# Добавляет хэш-правило "Запрещено". Возвращает GUID правила в виде {xxxxxxxx-...}.
+function Add-SrpHashBlock {
+    param(
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
+        [Parameter(Mandatory)][string]$Hash,
+        [long]$Size,
+        [string]$LinkTarget
+    )
+    if (-not (Test-HashValue -Algorithm $Algorithm -Hash $Hash)) {
+        throw "Некорректный $Algorithm-хэш: '$Hash'."
+    }
+    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget)
+
+    $ruleId = [Guid]::NewGuid().ToString('B')
+    $key = '{0}\0\Hashes\{1}' -f $script:SrpBase, $ruleId
+    $bytes = ConvertFrom-HexString -Hex $Hash
+
+    $description = '{0} (добавлено ProcessMonitor {1})' -f $Name, (Get-Date).ToString('yyyy-MM-dd')
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName ItemData -Type Binary -Value $bytes)
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName ItemSize -Type QWord -Value $Size)
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName HashAlg -Type DWord -Value $script:SrpHashAlg[$Algorithm])
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName SaferFlags -Type DWord -Value 0)
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName LastModified -Type QWord -Value ([DateTime]::UtcNow.ToFileTimeUtc()))
+    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName Description -Type String -Value $description)
+    return $ruleId
+}
+
+function Remove-SrpHashBlock {
+    param(
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][string]$RuleId
+    )
+    Import-Module GroupPolicy -ErrorAction Stop
+    $key = '{0}\0\Hashes\{1}' -f $script:SrpBase, $RuleId
+    [void](Remove-GPRegistryValue -Name $GpoName -Key $key -ErrorAction Stop)
+}
+
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()

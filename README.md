@@ -20,8 +20,8 @@
 
 * Windows PowerShell 5.1, права администратора домена (или делегированные права на WinRM целей и редактирование GPO);
 * модуль **GroupPolicy** (RSAT → Group Policy Management) — для блокировки;
-* драйвер SQLite — один раз выполните `.\Install-SQLite.ps1` (скачивает `System.Data.SQLite` с nuget.org в `lib\sqlite`).
-  Без интернета скопируйте папку `lib\sqlite` с другой машины.
+* драйвер SQLite: при первом запуске скрипт сам предложит скачать `System.Data.SQLite` с nuget.org в `lib\sqlite` рядом со скриптом.
+  Без интернета скопируйте папку `lib\sqlite` (`System.Data.SQLite.dll`, `x64\SQLite.Interop.dll`, `x86\SQLite.Interop.dll`) с другой машины.
 
 На целевых компьютерах:
 
@@ -31,7 +31,6 @@
 ## Запуск
 
 ```powershell
-.\Install-SQLite.ps1                                   # один раз
 powershell -STA -ExecutionPolicy Bypass -File .\ProcessMonitor.ps1
 ```
 
@@ -80,13 +79,12 @@ HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Hashes\{GUID}
 
 ## Структура
 
+Всё приложение — один файл `ProcessMonitor.ps1` (интерфейс, SQLite, сбор, блокировка). Рядом при работе создаются:
+
 ```
-ProcessMonitor.ps1      главное окно и обработчики
-src\Database.ps1        SQLite: сканирования, процессы, журнал блокировок
-src\Collector.ps1       список из AD, удалённый сбор (Invoke-Command -AsJob)
-src\Blocker.ps1         SRP-правила в GPO
-Install-SQLite.ps1      загрузка System.Data.SQLite
+data\processes.db   база данных
+lib\sqlite\         драйвер SQLite (скачивается автоматически)
 ```
 
-Файлы `.ps1` сохранены в UTF-8 **с BOM** — это нужно Windows PowerShell 5.1 для корректного чтения кириллицы.
-Если будете править, сохраняйте в той же кодировке.
+Файл сохранён в UTF-8 **с BOM** — это нужно Windows PowerShell 5.1 для корректного чтения кириллицы.
+Если будете править, сохраняйте в той же кодировке (иначе кириллица будет испорчена).
