@@ -7,386 +7,309 @@
     Графическое приложение (WinForms):
       * берёт список компьютеров из AD;
       * по WinRM собирает запущенные процессы и их хэши (MD5 / SHA1 / SHA256);
-      * показывает таблицу |№|Дата|Имя|Хэш| (плюс компьютер и путь) и хранит историю в SQLite;
+      * показывает таблицу |№|Дата|Имя|Хэш| (плюс компьютер и путь) и хранит историю в JSON-файлах;
       * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO.
 
-    Скрипт самодостаточный (один файл). Драйвер SQLite скачивается при первом запуске.
+    Скрипт самодостаточный (один файл), сторонних драйверов не требует.
     Подробности и требования - в README.md.
 
-.PARAMETER DbPath
-    Путь к файлу базы SQLite. По умолчанию data\processes.db рядом со скриптом.
+.PARAMETER DataPath
+    Папка для JSON-файлов с данными. По умолчанию data рядом со скриптом. Прежнее имя -DbPath работает как псевдоним.
 #>
 [CmdletBinding()]
 param(
-    [string]$DbPath
+    [Alias('DbPath')]
+    [string]$DataPath
 )
 
 # WinForms требует STA; в Windows PowerShell 5.1 консоль обычно уже STA, но не при запуске из ISE/планировщика.
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
-    if ($DbPath) { $relaunch += @('-DbPath', "`"$DbPath`"") }
+    if ($DataPath) { $relaunch += @('-DataPath', "`"$DataPath`"") }
     & powershell.exe @relaunch
     exit $LASTEXITCODE
 }
 
 # ПЕРЕМЕННЫЕ ВЕРХНЕГО УРОВНЯ
-#   $DbPath           - параметр скрипта: путь к файлу базы SQLite (если не задан - data\processes.db).
+#   $DataPath         - параметр скрипта: папка JSON-файлов с данными (если не задана - data рядом со скриптом).
 #   $relaunch         - (в блоке выше) аргументы для повторного запуска powershell.exe в режиме STA.
-#   $script:AppRoot   - папка, где лежит скрипт; от неё строятся пути к lib\sqlite и data\.
+#   $script:AppRoot   - папка, где лежит скрипт; от неё строятся путь к папке data\.
 $script:AppRoot = $PSScriptRoot
-if (-not $DbPath) { $DbPath = Join-Path $script:AppRoot 'data\processes.db' }
+if (-not $DataPath) { $DataPath = Join-Path $script:AppRoot 'data' }
 
 # ===========================================================================
-# Хранилище SQLite
+# Хранилище данных (JSON-файлы)
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Драйвер SQLite: System.Data.SQLite скачивается с nuget.org при первом запуске
-# ---------------------------------------------------------------------------
+# Что лежит в папке данных ($script:DataPath, по умолчанию data\ рядом со скриптом):
+#   scans.json              - список сканирований: номер, дата, сколько компьютеров опрошено / ответило / не ответило,
+#                             имена ответивших компьютеров;
+#   scans\scan-000001.json  - процессы одного сканирования (по файлу на каждое сканирование);
+#   blocks.json             - журнал блокировок.
+# Файлы - обычный UTF-8 JSON без BOM, их можно открыть в любом редакторе. Запись идёт через временный
+# файл (.tmp) с последующей заменой, поэтому обрыв посреди записи не портит уже сохранённые данные.
+# Приложение рассчитано на один запущенный экземпляр: одновременная запись из двух окон не поддерживается.
 
-# Install-SQLiteDriver - скачивает драйвер System.Data.SQLite с nuget.org в lib\sqlite.
-#   -Version    версия NuGet-пакета (по умолчанию 1.0.118).
-#   -Framework  сборка под какую версию .NET брать; net45 работает везде, где есть PowerShell 5.1.
-#   Локальные: $target - папка назначения; $package - временный файл .nupkg; $url - адрес пакета;
-#   $files - соответствие "путь внутри пакета -> куда положить"; $extracted - сколько файлов распаковано;
-#   $zip - открытый архив; $entry - текущий файл архива; $dest / $destDir - итоговый файл и его папка.
-#   Бросает исключение, если в пакете найдены не все три файла.
-function Install-SQLiteDriver {
-    param(
-        [string]$Version = '1.0.118',
-        [string]$Framework = 'net45'    # работает везде, где есть PowerShell 5.1
-    )
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+# $script:DataPath - папка с JSON-файлами; заполняется в Initialize-Database.
+# $script:Scans    - список сканирований из scans.json, держится в памяти (ArrayList словарей: Id, ScanDate, Requested,
+#                    Succeeded, Failed, Computers). Процессы в память целиком не загружаются - читаются по запросу.
+# $script:Blocks   - журнал блокировок из blocks.json в памяти (ArrayList словарей: Id, BlockDate, Name, Algorithm,
+#                    Hash, Size, GpoName, RuleId, Active).
+# $script:JsonSerializer - быстрый сериализатор JSON из .NET Framework (JavaScriptSerializer). Если он недоступен
+#                    (например, при проверке на PowerShell 7), используются ConvertTo-Json / ConvertFrom-Json.
+$script:DataPath = $null
+$script:Scans = $null
+$script:Blocks = $null
+$script:JsonSerializer = $null
+try {
+    Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+    $script:JsonSerializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $script:JsonSerializer.MaxJsonLength = [int]::MaxValue     # по умолчанию лимит 2 МБ - для списка процессов мало
+}
+catch {
+    $script:JsonSerializer = $null
+}
 
-    $target = Join-Path $script:AppRoot 'lib\sqlite'
-    $package = Join-Path ([IO.Path]::GetTempPath()) ('sqlite-{0}.nupkg' -f [Guid]::NewGuid().ToString('N'))
-    $id = 'stub.system.data.sqlite.core.netframework'
-    $url = 'https://api.nuget.org/v3-flatcontainer/{0}/{1}/{0}.{1}.nupkg' -f $id, $Version
-    $files = @{
-        ('lib/{0}/System.Data.SQLite.dll' -f $Framework)   = 'System.Data.SQLite.dll'
-        ('build/{0}/x64/SQLite.Interop.dll' -f $Framework) = 'x64\SQLite.Interop.dll'
-        ('build/{0}/x86/SQLite.Interop.dll' -f $Framework) = 'x86\SQLite.Interop.dll'
-    }
+# ConvertTo-JsonText - превращает данные (словари, списки, строки, числа) в текст JSON. -Data что сериализовать.
+function ConvertTo-JsonText {
+    param([Parameter(Mandatory)]$Data)
+    if ($script:JsonSerializer) { return $script:JsonSerializer.Serialize($Data) }
+    return (ConvertTo-Json -InputObject $Data -Depth 10 -Compress)
+}
 
-    Invoke-WebRequest -Uri $url -OutFile $package -UseBasicParsing
-    $extracted = 0
-    $zip = [IO.Compression.ZipFile]::OpenRead($package)
+# ConvertFrom-JsonText - превращает текст JSON в словари и массивы (объект JSON -> словарь, доступ $d['Ключ']).
+#   -Text строка с JSON.
+function ConvertFrom-JsonText {
+    param([Parameter(Mandatory)][string]$Text)
+    if ($script:JsonSerializer) { return $script:JsonSerializer.DeserializeObject($Text) }
+    return (ConvertFrom-Json -InputObject $Text -AsHashtable)
+}
+
+# Read-JsonFile - читает JSON-файл. Возвращает $null, если файла нет или он пустой; если файл повреждён - ошибка.
+#   -Path путь к файлу. $text - содержимое файла.
+function Read-JsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
     try {
-        foreach ($entry in $zip.Entries) {
-            if (-not $files.ContainsKey($entry.FullName)) { continue }
-            $dest = Join-Path $target $files[$entry.FullName]
-            $destDir = Split-Path -Parent $dest
-            if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir | Out-Null }
-            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
-            $extracted++
-        }
+        return (ConvertFrom-JsonText -Text $text)
     }
-    finally {
-        $zip.Dispose()
-        Remove-Item -LiteralPath $package -Force -ErrorAction SilentlyContinue
-    }
-    if ($extracted -ne $files.Count) {
-        throw "В пакете $url найдено файлов: $extracted из $($files.Count)."
+    catch {
+        throw "Файл повреждён или не является JSON: $Path ($($_.Exception.Message))"
     }
 }
 
-# $script:DbPath       - путь к открытому файлу базы; заполняется в Initialize-Database.
-# $script:SQLiteLoaded - признак того, что System.Data.SQLite.dll уже загружен (чтобы не грузить повторно).
-$script:DbPath = $null
-$script:SQLiteLoaded = $false
-
-# Import-SQLite - загружает System.Data.SQLite.dll в сессию. Если файла нет, предлагает скачать
-#   его (Install-SQLiteDriver). Локальная $dll - путь к lib\sqlite\System.Data.SQLite.dll,
-#   $answer - ответ пользователя в окне "скачать?".
-function Import-SQLite {
-    if ($script:SQLiteLoaded) { return }
-    $dll = Join-Path $script:AppRoot 'lib\sqlite\System.Data.SQLite.dll'
-    if (-not (Test-Path -LiteralPath $dll)) {
-        $answer = [System.Windows.Forms.MessageBox]::Show(
-            "Не найден драйвер SQLite:`n$dll`n`nСкачать System.Data.SQLite с nuget.org сейчас?",
-            'Process Monitor', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
-            throw "Драйвер SQLite не установлен. Положите System.Data.SQLite.dll (+ x64\x86 SQLite.Interop.dll) в $(Split-Path -Parent $dll)."
-        }
-        Install-SQLiteDriver
-    }
-    Add-Type -Path $dll
-    $script:SQLiteLoaded = $true
+# Write-JsonFile - записывает данные в JSON-файл (UTF-8 без BOM) через временный файл. Создаёт папку при необходимости.
+#   -Path файл; -Data данные. $dir - папка файла; $tmp - временный файл рядом с целевым.
+function Write-JsonFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Data)
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, (ConvertTo-JsonText -Data $Data), (New-Object System.Text.UTF8Encoding($false)))
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }    # без резервной копии
+    else { [System.IO.File]::Move($tmp, $Path) }
 }
 
-# Open-Db - открывает новое подключение к базе ($script:DbPath) и возвращает его.
-#   Вызывающий обязан закрыть подключение (Dispose). Локальная $conn - само подключение.
-function Open-Db {
-    $conn = New-Object System.Data.SQLite.SQLiteConnection("Data Source=$($script:DbPath);Version=3;")
-    $conn.Open()
-    return $conn
+# Get-JsonList - достаёт из прочитанного документа список по ключу. Если документа или ключа нет - пустой массив.
+#   -Document словарь из Read-JsonFile (или $null); -Key имя поля, например 'Scans'.
+function Get-JsonList {
+    param($Document, [string]$Key)
+    if ($null -eq $Document -or -not $Document.ContainsKey($Key) -or $null -eq $Document[$Key]) { return @() }
+    return @($Document[$Key])
 }
 
-# Add-DbParameters - добавляет в SQL-команду параметры из хэш-таблицы (ключ "x" -> параметр @x).
-#   -Command  команда SQLite; -Params  хэш-таблица имя/значение (может быть пустой).
-#   $null превращается в DBNull. Параметры защищают от SQL-инъекций.
-function Add-DbParameters {
-    param($Command, [hashtable]$Params)
-    if (-not $Params) { return }
-    foreach ($key in $Params.Keys) {
-        $value = $Params[$key]
-        if ($null -eq $value) { $value = [DBNull]::Value }
-        [void]$Command.Parameters.AddWithValue("@$key", $value)
-    }
-}
-
-# Invoke-DbNonQuery - выполняет INSERT/UPDATE/CREATE; возвращает число затронутых строк.
-#   -Sql  текст запроса; -Params  параметры; -Connection  готовое подключение (если не задано,
-#   функция откроет своё и закроет в конце). $own - "подключение открыто здесь, закрыть тоже здесь";
-#   $cmd - команда.
-function Invoke-DbNonQuery {
-    param(
-        [Parameter(Mandatory)][string]$Sql,
-        [hashtable]$Params,
-        [object]$Connection
-    )
-    $own = -not $Connection
-    if ($own) { $Connection = Open-Db }
-    try {
-        $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = $Sql
-        Add-DbParameters -Command $cmd -Params $Params
-        return $cmd.ExecuteNonQuery()
-    }
-    finally {
-        if ($own) { $Connection.Dispose() }
-    }
-}
-
-# Invoke-DbScalar - выполняет запрос и возвращает одно значение (первая ячейка первой строки).
-#   Параметры те же, что у Invoke-DbNonQuery.
-function Invoke-DbScalar {
-    param(
-        [Parameter(Mandatory)][string]$Sql,
-        [hashtable]$Params,
-        [object]$Connection
-    )
-    $own = -not $Connection
-    if ($own) { $Connection = Open-Db }
-    try {
-        $cmd = $Connection.CreateCommand()
-        $cmd.CommandText = $Sql
-        Add-DbParameters -Command $cmd -Params $Params
-        return $cmd.ExecuteScalar()
-    }
-    finally {
-        if ($own) { $Connection.Dispose() }
-    }
-}
-
-# Invoke-DbQuery - выполняет SELECT и возвращает результат как System.Data.DataTable.
-#   -Sql  текст запроса; -Params  параметры. $adapter - заполняет таблицу, $table - результат.
-function Invoke-DbQuery {
-    param(
-        [Parameter(Mandatory)][string]$Sql,
-        [hashtable]$Params
-    )
-    $conn = Open-Db
-    try {
-        $cmd = $conn.CreateCommand()
-        $cmd.CommandText = $Sql
-        Add-DbParameters -Command $cmd -Params $Params
-        $adapter = New-Object System.Data.SQLite.SQLiteDataAdapter($cmd)
-        $table = New-Object System.Data.DataTable
-        [void]$adapter.Fill($table)
-        return , $table
-    }
-    finally {
-        $conn.Dispose()
-    }
-}
-
-# Initialize-Database - подключает драйвер, создаёт папку и файл базы и таблицы, если их нет.
-#   -Path  путь к файлу базы. Таблицы:
-#     Scans     - одно сканирование: дата, сколько компьютеров опрошено / ответило / не ответило;
-#     Processes - найденные процессы (компьютер, имя, путь, размер, MD5, SHA1, SHA256) по сканированиям;
-#     Blocks    - журнал блокировок (хэш, алгоритм, GPO, GUID правила, Active=1 если блокировка действует).
-#   Локальные: $dir - папка файла базы; $schema - список SQL-команд создания таблиц и индексов;
-#   $conn - подключение; $sql - текущая команда.
+# Initialize-Database - готовит хранилище: создаёт папку данных, читает scans.json и blocks.json в память и
+#   проверяет, что в папку можно писать (при первом запуске создаёт пустые файлы).
+#   -Path папка данных. Бросает исключение, если файлы повреждены или папка недоступна для записи.
 function Initialize-Database {
     param([Parameter(Mandatory)][string]$Path)
 
-    Import-SQLite
-    $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir | Out-Null
-    }
-    $script:DbPath = $Path
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+    $script:DataPath = $Path
+    $script:Scans = New-Object System.Collections.ArrayList
+    $script:Blocks = New-Object System.Collections.ArrayList
 
-    $schema = @(
-        'CREATE TABLE IF NOT EXISTS Scans (
-            Id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            ScanDate  TEXT    NOT NULL,
-            Requested INTEGER NOT NULL DEFAULT 0,
-            Succeeded INTEGER NOT NULL DEFAULT 0,
-            Failed    INTEGER NOT NULL DEFAULT 0
-        )',
-        'CREATE TABLE IF NOT EXISTS Processes (
-            Id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            ScanId   INTEGER NOT NULL REFERENCES Scans(Id),
-            ScanDate TEXT    NOT NULL,
-            Computer TEXT    NOT NULL,
-            Name     TEXT    NOT NULL,
-            Path     TEXT,
-            Size     INTEGER,
-            MD5      TEXT,
-            SHA1     TEXT,
-            SHA256   TEXT
-        )',
-        'CREATE INDEX IF NOT EXISTS IX_Processes_Scan     ON Processes (ScanId)',
-        'CREATE INDEX IF NOT EXISTS IX_Processes_Computer ON Processes (Computer, ScanId)',
-        'CREATE INDEX IF NOT EXISTS IX_Processes_MD5      ON Processes (MD5)',
-        'CREATE INDEX IF NOT EXISTS IX_Processes_SHA1     ON Processes (SHA1)',
-        'CREATE INDEX IF NOT EXISTS IX_Processes_SHA256   ON Processes (SHA256)',
-        'CREATE TABLE IF NOT EXISTS Blocks (
-            Id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            BlockDate TEXT    NOT NULL,
-            Name      TEXT,
-            Algorithm TEXT    NOT NULL,
-            Hash      TEXT    NOT NULL,
-            Size      INTEGER,
-            GpoName   TEXT    NOT NULL,
-            RuleId    TEXT    NOT NULL,
-            Active    INTEGER NOT NULL DEFAULT 1
-        )'
-    )
-    $conn = Open-Db
-    try {
-        foreach ($sql in $schema) {
-            [void](Invoke-DbNonQuery -Sql $sql -Connection $conn)
-        }
-    }
-    finally {
-        $conn.Dispose()
-    }
+    $scansFile = Join-Path $Path 'scans.json'
+    $blocksFile = Join-Path $Path 'blocks.json'
+    $scansDoc = Read-JsonFile -Path $scansFile
+    $blocksDoc = Read-JsonFile -Path $blocksFile
+    foreach ($item in (Get-JsonList -Document $scansDoc -Key 'Scans')) { [void]$script:Scans.Add($item) }
+    foreach ($item in (Get-JsonList -Document $blocksDoc -Key 'Blocks')) { [void]$script:Blocks.Add($item) }
+
+    if (-not $scansDoc) { Save-ScanIndex }
+    if (-not $blocksDoc) { Save-BlockLog }
+}
+
+# Save-ScanIndex - записывает список сканирований из памяти в scans.json.
+function Save-ScanIndex {
+    Write-JsonFile -Path (Join-Path $script:DataPath 'scans.json') -Data ([ordered]@{ Version = 1; Scans = $script:Scans })
+}
+
+# Save-BlockLog - записывает журнал блокировок из памяти в blocks.json.
+function Save-BlockLog {
+    Write-JsonFile -Path (Join-Path $script:DataPath 'blocks.json') -Data ([ordered]@{ Version = 1; Blocks = $script:Blocks })
+}
+
+# Get-ScanFilePath - путь к файлу с процессами сканирования: <данные>\scans\scan-000001.json. -Id номер сканирования.
+function Get-ScanFilePath {
+    param([Parameter(Mandatory)][int]$Id)
+    Join-Path (Join-Path $script:DataPath 'scans') ('scan-{0:D6}.json' -f $Id)
 }
 
 # ---- Сканирования и процессы -------------------------------------------------
 
-# New-Scan - создаёт запись нового сканирования с текущей датой.
-#   -Requested  сколько компьютеров собираются опрашивать.
-#   Возвращает объект { Id = номер сканирования, Date = дата-время "гггг-мм-дд чч:мм:сс" }.
+# New-Scan - выдаёт номер и дату нового сканирования (в файл ничего не пишется до Save-Processes).
+#   -Requested сколько компьютеров собираются опрашивать.
+#   Возвращает { Id = номер (на 1 больше максимального), Date = "гггг-мм-дд чч:мм:сс", Requested }.
 function New-Scan {
     param([int]$Requested)
-    $date = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $conn = Open-Db
-    try {
-        [void](Invoke-DbNonQuery -Connection $conn -Params @{ d = $date; r = $Requested } `
-            -Sql 'INSERT INTO Scans (ScanDate, Requested) VALUES (@d, @r)')
-        $id = [int](Invoke-DbScalar -Connection $conn -Sql 'SELECT last_insert_rowid()')
+    $id = 1
+    foreach ($scan in $script:Scans) {
+        if ([int]$scan['Id'] -ge $id) { $id = [int]$scan['Id'] + 1 }
     }
-    finally {
-        $conn.Dispose()
-    }
-    return [pscustomobject]@{ Id = $id; Date = $date }
+    return [pscustomobject]@{ Id = $id; Date = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Requested = $Requested }
 }
 
-# Save-Processes - одной транзакцией сохраняет собранные процессы и итоги сканирования.
-#   -ScanId, -ScanDate  сканирование, к которому относятся строки; -Rows  собранные объекты с удалённых
-#   компьютеров; -Succeeded / -Failed  сколько компьютеров ответило / не ответило.
-#   Локальные: $tx - транзакция (при ошибке откатывается); $cmd - команда INSERT; $p - таблица
-#   параметров команды (меняется значение на каждой строке, что быстрее, чем создавать заново);
-#   $r - текущая строка; $n - имя параметра. Имена компьютеров и хэши сохраняются в ВЕРХНЕМ регистре.
+# Save-Processes - сохраняет собранные процессы сканирования в его файл и добавляет сканирование в scans.json.
+#   Сначала пишется файл с процессами, потом индекс: сканирование "появляется" только после успешной записи обоих.
+#   -ScanId, -ScanDate, -Requested  данные из New-Scan; -Rows  собранные объекты с удалённых компьютеров;
+#   -Succeeded / -Failed  сколько компьютеров ответило / не ответило.
+#   Локальные: $computers - имена компьютеров, приславших данные; $list - записи процессов для файла;
+#   $r - текущая строка. Имена компьютеров и хэши сохраняются в ВЕРХНЕМ регистре, строки упорядочены
+#   по компьютеру и имени.
 function Save-Processes {
     param(
         [Parameter(Mandatory)][int]$ScanId,
         [Parameter(Mandatory)][string]$ScanDate,
+        [int]$Requested,
         [object[]]$Rows,
         [int]$Succeeded,
         [int]$Failed
     )
-    $conn = Open-Db
-    try {
-        $tx = $conn.BeginTransaction()
-        try {
-            $cmd = $conn.CreateCommand()
-            $cmd.Transaction = $tx
-            $cmd.CommandText = 'INSERT INTO Processes (ScanId, ScanDate, Computer, Name, Path, Size, MD5, SHA1, SHA256)
-                                VALUES (@scan, @date, @comp, @name, @path, @size, @md5, @sha1, @sha256)'
-            $p = @{}
-            foreach ($n in 'scan', 'date', 'comp', 'name', 'path', 'size', 'md5', 'sha1', 'sha256') {
-                $p[$n] = $cmd.Parameters.AddWithValue("@$n", [DBNull]::Value)
-            }
-            foreach ($r in $Rows) {
-                $p.scan.Value = $ScanId
-                $p.date.Value = $ScanDate
-                $p.comp.Value = ([string]$r.Computer).ToUpper()
-                $p.name.Value = [string]$r.Name
-                $p.path.Value = [string]$r.Path
-                $p.size.Value = [long]$r.Size
-                $p.md5.Value = ([string]$r.MD5).ToUpper()
-                $p.sha1.Value = ([string]$r.SHA1).ToUpper()
-                $p.sha256.Value = ([string]$r.SHA256).ToUpper()
-                [void]$cmd.ExecuteNonQuery()
-            }
-            [void](Invoke-DbNonQuery -Connection $conn -Params @{ id = $ScanId; ok = $Succeeded; bad = $Failed } `
-                -Sql 'UPDATE Scans SET Succeeded = @ok, Failed = @bad WHERE Id = @id')
-            $tx.Commit()
-        }
-        catch {
-            $tx.Rollback()
-            throw
-        }
+    $computers = @{}
+    $list = New-Object System.Collections.ArrayList
+    foreach ($r in @($Rows | Sort-Object { [string]$_.Computer }, { [string]$_.Name })) {
+        $computer = ([string]$r.Computer).ToUpper()
+        $computers[$computer] = $true
+        [void]$list.Add([ordered]@{
+                Computer = $computer
+                Name     = [string]$r.Name
+                Path     = [string]$r.Path
+                Size     = [long]$r.Size
+                MD5      = ([string]$r.MD5).ToUpper()
+                SHA1     = ([string]$r.SHA1).ToUpper()
+                SHA256   = ([string]$r.SHA256).ToUpper()
+            })
     }
-    finally {
-        $conn.Dispose()
+    Write-JsonFile -Path (Get-ScanFilePath -Id $ScanId) -Data ([ordered]@{ Version = 1; ScanId = $ScanId; Processes = $list })
+
+    [void]$script:Scans.Add([ordered]@{
+            Id        = $ScanId
+            ScanDate  = $ScanDate
+            Requested = $Requested
+            Succeeded = $Succeeded
+            Failed    = $Failed
+            Computers = [string[]]@($computers.Keys | Sort-Object)
+        })
+    try {
+        Save-ScanIndex
+    }
+    catch {
+        $script:Scans.RemoveAt($script:Scans.Count - 1)     # индекс не записан - откатываем и в памяти
+        throw
     }
 }
 
 # Get-Scans - список сканирований (новые сверху) для выпадающего списка.
 #   Возвращает таблицу: Id и Title вида "2026-10-12 14:03:11  (ПК: 42 из 50)".
 function Get-Scans {
-    Invoke-DbQuery -Sql "SELECT Id,
-            ScanDate || '  (ПК: ' || Succeeded || ' из ' || Requested || ')' AS Title
-        FROM Scans ORDER BY Id DESC"
+    $table = New-Object System.Data.DataTable
+    [void]$table.Columns.Add('Id', [int])
+    [void]$table.Columns.Add('Title', [string])
+    for ($i = $script:Scans.Count - 1; $i -ge 0; $i--) {
+        $scan = $script:Scans[$i]
+        $title = '{0}  (ПК: {1} из {2})' -f $scan['ScanDate'], $scan['Succeeded'], $scan['Requested']
+        [void]$table.Rows.Add([int]$scan['Id'], $title)
+    }
+    return , $table
 }
 
 # Get-ProcessTable - данные для основной таблицы процессов.
-#   -ScanId     номер сканирования; 0 - показать все сканирования;
+#   -ScanId     номер сканирования; 0 - показать все сканирования (новые первыми);
 #   -Algorithm  какой хэш показывать в колонке Hash: MD5, SHA1 или SHA256.
 #   Возвращает таблицу: ScanDate, Name, Hash, Computer, Path, Size.
-#   Локальные: $sql - текст запроса (имя алгоритма подставляется только после проверки ValidateSet),
-#   $params - параметры запроса.
+#   Локальные: $table - результат; $scan - сканирование из индекса; $doc - прочитанный файл сканирования;
+#   $p - процесс из файла. Если файл сканирования потерян, оно пропускается.
 function Get-ProcessTable {
     param(
         [int]$ScanId = 0,
         [ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm = 'MD5'
     )
-    # $Algorithm прошёл ValidateSet, поэтому подставлять его в SQL безопасно.
-    $sql = "SELECT ScanDate, Name, $Algorithm AS Hash, Computer, Path, Size FROM Processes"
-    $params = @{}
-    if ($ScanId -gt 0) {
-        $sql += ' WHERE ScanId = @scan'
-        $params.scan = $ScanId
+    $table = New-Object System.Data.DataTable
+    [void]$table.Columns.Add('ScanDate', [string])
+    [void]$table.Columns.Add('Name', [string])
+    [void]$table.Columns.Add('Hash', [string])
+    [void]$table.Columns.Add('Computer', [string])
+    [void]$table.Columns.Add('Path', [string])
+    [void]$table.Columns.Add('Size', [long])
+
+    $table.BeginLoadData()
+    for ($i = $script:Scans.Count - 1; $i -ge 0; $i--) {
+        $scan = $script:Scans[$i]
+        if ($ScanId -gt 0 -and [int]$scan['Id'] -ne $ScanId) { continue }
+        $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
+        foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
+            [void]$table.Rows.Add([string]$scan['ScanDate'], [string]$p['Name'], [string]$p[$Algorithm],
+                [string]$p['Computer'], [string]$p['Path'], [long]$p['Size'])
+        }
     }
-    $sql += ' ORDER BY ScanDate DESC, Computer, Name'
-    Invoke-DbQuery -Sql $sql -Params $params
+    $table.EndLoadData()
+    return , $table
 }
 
 # Get-HashLocations - где найден хэш: компьютеры и пути по ПОСЛЕДНЕМУ сканированию каждого компьютера.
 #   Нужна, чтобы показать "найден на N компьютерах" и чтобы знать, где завершать процессы.
 #   -Algorithm, -Hash  алгоритм и значение хэша. Возвращает таблицу: Computer, Path.
+#   Идём по сканированиям от новых к старым; $resolved - компьютеры, для которых последнее сканирование уже
+#   найдено; $fresh - компьютеры, для которых текущее сканирование - последнее; $seen - защита от повторов.
 function Get-HashLocations {
     param(
         [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
         [Parameter(Mandatory)][string]$Hash
     )
-    Invoke-DbQuery -Params @{ h = $Hash.ToUpper() } -Sql "SELECT DISTINCT p.Computer, p.Path FROM Processes p
-        WHERE p.$Algorithm = @h
-          AND p.ScanId = (SELECT MAX(ScanId) FROM Processes WHERE Computer = p.Computer)"
+    $table = New-Object System.Data.DataTable
+    [void]$table.Columns.Add('Computer', [string])
+    [void]$table.Columns.Add('Path', [string])
+
+    $wanted = $Hash.ToUpper()
+    $resolved = @{}
+    $seen = @{}
+    for ($i = $script:Scans.Count - 1; $i -ge 0; $i--) {
+        $scan = $script:Scans[$i]
+        $fresh = @{}
+        foreach ($c in @($scan['Computers'])) {
+            if ($c -and -not $resolved.ContainsKey($c)) { $fresh[$c] = $true; $resolved[$c] = $true }
+        }
+        if ($fresh.Count -eq 0) { continue }
+        $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
+        foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
+            if ([string]$p[$Algorithm] -ne $wanted -or -not $fresh.ContainsKey([string]$p['Computer'])) { continue }
+            $key = '{0}|{1}' -f $p['Computer'], $p['Path']
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            [void]$table.Rows.Add([string]$p['Computer'], [string]$p['Path'])
+        }
+    }
+    return , $table
 }
 
 # ---- Блокировки ------------------------------------------------------------
 
-# Add-BlockRecord - записывает в журнал блокировок (таблица Blocks) новую активную блокировку.
+# Add-BlockRecord - записывает в журнал блокировок (blocks.json) новую активную блокировку.
 #   -Name имя файла; -Algorithm и -Hash хэш; -Size размер файла; -GpoName в какой GPO добавлено правило;
-#   -RuleId GUID правила в GPO (по нему правило потом удаляется).
+#   -RuleId GUID правила в GPO (по нему правило потом удаляется). Номер записи = максимальный + 1.
 function Add-BlockRecord {
     param(
         [string]$Name,
@@ -396,35 +319,71 @@ function Add-BlockRecord {
         [Parameter(Mandatory)][string]$GpoName,
         [Parameter(Mandatory)][string]$RuleId
     )
-    [void](Invoke-DbNonQuery -Params @{
-            d = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); n = $Name; a = $Algorithm
-            h = $Hash.ToUpper(); s = $Size; g = $GpoName; r = $RuleId
-        } -Sql 'INSERT INTO Blocks (BlockDate, Name, Algorithm, Hash, Size, GpoName, RuleId)
-                VALUES (@d, @n, @a, @h, @s, @g, @r)')
+    $id = 1
+    foreach ($b in $script:Blocks) {
+        if ([int]$b['Id'] -ge $id) { $id = [int]$b['Id'] + 1 }
+    }
+    [void]$script:Blocks.Add([ordered]@{
+            Id        = $id
+            BlockDate = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Name      = $Name
+            Algorithm = $Algorithm
+            Hash      = $Hash.ToUpper()
+            Size      = $Size
+            GpoName   = $GpoName
+            RuleId    = $RuleId
+            Active    = 1
+        })
+    try {
+        Save-BlockLog
+    }
+    catch {
+        $script:Blocks.RemoveAt($script:Blocks.Count - 1)
+        throw
+    }
 }
 
 # Get-BlockTable - все блокировки (новые сверху) для вкладки "Блокировки".
 #   Поле Status: "Активна" (Active=1) или "Снята".
 function Get-BlockTable {
-    Invoke-DbQuery -Sql "SELECT Id, BlockDate, Name, Algorithm, Hash, GpoName, RuleId, Active,
-            CASE Active WHEN 1 THEN 'Активна' ELSE 'Снята' END AS Status
-        FROM Blocks ORDER BY Id DESC"
+    $table = New-Object System.Data.DataTable
+    [void]$table.Columns.Add('Id', [int])
+    [void]$table.Columns.Add('BlockDate', [string])
+    [void]$table.Columns.Add('Name', [string])
+    [void]$table.Columns.Add('Algorithm', [string])
+    [void]$table.Columns.Add('Hash', [string])
+    [void]$table.Columns.Add('GpoName', [string])
+    [void]$table.Columns.Add('RuleId', [string])
+    [void]$table.Columns.Add('Active', [int])
+    [void]$table.Columns.Add('Status', [string])
+    for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
+        $b = $script:Blocks[$i]
+        $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
+        [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
+            [string]$b['Hash'], [string]$b['GpoName'], [string]$b['RuleId'], [int]$b['Active'], $status)
+    }
+    return , $table
 }
 
 # Get-ActiveBlock - ищет действующую блокировку для пары алгоритм+хэш.
-#   Возвращает строку таблицы или $null, если такой блокировки нет (защита от дублей).
+#   Возвращает запись журнала (словарь) или $null, если такой блокировки нет (защита от дублей).
 function Get-ActiveBlock {
     param([string]$Algorithm, [string]$Hash)
-    $t = Invoke-DbQuery -Params @{ a = $Algorithm; h = $Hash.ToUpper() } `
-        -Sql 'SELECT * FROM Blocks WHERE Active = 1 AND Algorithm = @a AND Hash = @h LIMIT 1'
-    if ($t.Rows.Count -gt 0) { return $t.Rows[0] }
+    foreach ($b in $script:Blocks) {
+        if ([int]$b['Active'] -eq 1 -and [string]$b['Algorithm'] -eq $Algorithm -and [string]$b['Hash'] -eq $Hash.ToUpper()) {
+            return $b
+        }
+    }
     return $null
 }
 
-# Disable-BlockRecord - помечает блокировку в журнале снятой (Active=0). -Id  номер записи в Blocks.
+# Disable-BlockRecord - помечает блокировку в журнале снятой (Active=0) и сохраняет файл. -Id номер записи.
 function Disable-BlockRecord {
     param([Parameter(Mandatory)][int]$Id)
-    [void](Invoke-DbNonQuery -Params @{ id = $Id } -Sql 'UPDATE Blocks SET Active = 0 WHERE Id = @id')
+    foreach ($b in $script:Blocks) {
+        if ([int]$b['Id'] -eq $Id) { $b['Active'] = 0 }
+    }
+    Save-BlockLog
 }
 
 # ===========================================================================
@@ -795,10 +754,10 @@ function Confirm-Action {
 }
 
 try {
-    Initialize-Database -Path $DbPath
+    Initialize-Database -Path $DataPath
 }
 catch {
-    Show-Message -Text "Не удалось открыть базу данных:`n$($_.Exception.Message)" -Icon Error
+    Show-Message -Text "Не удалось открыть хранилище данных:`n$($_.Exception.Message)" -Icon Error
     exit 1
 }
 
@@ -968,7 +927,7 @@ $tabComputers.Controls.Add($compBar)
 # Вкладка "Процессы":
 #   $procBar - панель инструментов; $script:ScanCombo - выбор сканирования ("Все сканирования" или конкретное);
 #   $script:AlgoCombo - какой хэш показывать и использовать для блокировки (MD5/SHA1/SHA256);
-#   $script:FilterBox - поиск по имени, хэшу, компьютеру и пути; $btnRefresh - "Обновить" (перечитать БД);
+#   $script:FilterBox - поиск по имени, хэшу, компьютеру и пути; $btnRefresh - "Обновить" (перечитать данные);
 #   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, Дата, Имя, Хэш, Компьютер, Путь).
 $procBar = New-Toolbar
 $script:ScanCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 260; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
@@ -1155,7 +1114,7 @@ function Start-Scan {
     }
 }
 
-# Complete-Scan - вызывается, когда сбор завершён: показывает ошибки в журнале, сохраняет данные в базу
+# Complete-Scan - вызывается, когда сбор завершён: показывает ошибки в журнале, сохраняет данные в хранилище
 #   как новое сканирование и открывает его на вкладке "Процессы".
 #   -Job завершённое задание. Локальные: $requested - сколько компьютеров опрашивали; $result - итог
 #   (см. Receive-JobResults); $f - сбой одного компьютера; $scan - созданное сканирование (Id, Date).
@@ -1176,7 +1135,7 @@ function Complete-Scan {
     }
 
     $scan = New-Scan -Requested $requested
-    Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Rows $result.Data.ToArray() `
+    Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested $requested -Rows $result.Data.ToArray() `
         -Succeeded $result.Succeeded -Failed $result.Failures.Count
     Write-Log ("Сбор завершён: компьютеров {0} из {1}, записей {2}" -f $result.Succeeded, $requested, $result.Data.Count)
     Set-Status ("Сбор завершён: компьютеров {0} из {1}, записей {2}" -f $result.Succeeded, $requested, $result.Data.Count)
@@ -1196,7 +1155,7 @@ $script:ProcView = $null
 
 # Update-ScanList - перечитывает список сканирований в выпадающий список ("Все сканирования" + каждое
 #   сканирование) и обновляет таблицу. -SelectScanId  какое сканирование выбрать (0 - последнее).
-#   $table - таблица для списка; $row - строка сканирования из базы.
+#   $table - таблица для списка; $row - строка сканирования из хранилища.
 function Update-ScanList {
     param([int]$SelectScanId = 0)
     $script:Loading = $true
@@ -1225,7 +1184,7 @@ function Update-ScanList {
 }
 
 # Update-ProcessGrid - загружает процессы выбранного сканирования с выбранным алгоритмом хэша в таблицу и применяет поиск.
-#   $scanId - номер выбранного сканирования (0 - все); $algorithm - MD5/SHA1/SHA256; $table - данные из базы.
+#   $scanId - номер выбранного сканирования (0 - все); $algorithm - MD5/SHA1/SHA256; $table - данные из хранилища.
 function Update-ProcessGrid {
     if ($script:Loading) { return }
     $scanId = 0
@@ -1276,7 +1235,7 @@ function Update-ProcessFilter {
 # Блокировка
 # ---------------------------------------------------------------------------
 
-# Update-BlockGrid - перечитывает журнал блокировок из базы и показывает его на вкладке "Блокировки".
+# Update-BlockGrid - перечитывает журнал блокировок и показывает его на вкладке "Блокировки".
 function Update-BlockGrid {
     $script:BlockGrid.DataSource = (Get-BlockTable).DefaultView
 }
@@ -1432,7 +1391,7 @@ function Invoke-UnblockSelected {
 # Связь кнопок и действий. $i - элемент списка компьютеров; $n - имя, введённое для ручного добавления.
 #   "Остановить" останавливает $script:ScanJob; смена сканирования/алгоритма перезагружает таблицу;
 #   ввод в поле поиска фильтрует таблицу; при закрытии окна таймер и все фоновые задания останавливаются;
-#   при показе окна загружаются сканирования и блокировки, а в журнал пишется путь к базе и предупреждение,
+#   при показе окна загружаются сканирования и блокировки, а в журнал пишется путь к папке данных и предупреждение,
 #   если нет модуля GroupPolicy.
 $btnLoadAd.Add_Click({ Import-AdComputers })
 $btnAll.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $true } })
@@ -1466,7 +1425,7 @@ $script:Form.Add_FormClosing({
 $script:Form.Add_Shown({
         Update-ScanList
         Update-BlockGrid
-        Write-Log "База данных: $DbPath"
+        Write-Log "Данные: $DataPath"
         if (-not (Test-GroupPolicyModule)) {
             Write-Log 'Внимание: модуль GroupPolicy (RSAT) не найден - блокировка будет недоступна.'
         }
