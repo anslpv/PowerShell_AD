@@ -1,0 +1,3 @@
+# База данных и скачанный драйвер SQLite (см. Install-SQLite.ps1)
+data/
+lib/sqlite/
