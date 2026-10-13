@@ -865,6 +865,29 @@ function Add-SrpHashBlock {
 }
 
 # Remove-SrpHashBlock - удаляет правило из GPO по его GUID. -GpoName  имя GPO; -RuleId  GUID из журнала блокировок.
+# Get-GpoLinkSummary - сколько у GPO реальных привязок (Link) к OU/домену и сколько из них включено.
+#   Читает отчёт GPO (GenerateReport) и считает узлы <LinksTo> - именно по ним gpupdate на клиенте решает,
+#   какие GPO вообще обрабатывать; DefaultLevel/Hashes внутри самой GPO не играют роли, если привязок нет.
+#   -GpoName  имя GPO. Возвращает $null, если GPO не существует или отчёт получить не удалось (нет прав,
+#   не установлен модуль и т. п.) - в этом случае вызывающий код должен считать состояние неизвестным и не
+#   делать по одной этой проверке категоричных выводов. Иначе - { Total = всего привязок, Enabled = сколько
+#   из них включено (отключённые Link ничего не применяют), Paths = их DN }.
+#   Локальные: $gpo - объект GPO; $xml - разобранный XML-отчёт; $links - узлы <LinksTo>; $enabled - из них включённые.
+function Get-GpoLinkSummary {
+    param([Parameter(Mandatory)][string]$GpoName)
+    try {
+        Import-Module GroupPolicy -ErrorAction Stop
+        $gpo = Get-GPO -Name $GpoName -ErrorAction Stop
+        $xml = [xml]$gpo.GenerateReport([Microsoft.GroupPolicy.ReportType]::Xml)
+        $links = @($xml.GPO.LinksTo | Where-Object { $_ })
+        $enabled = @($links | Where-Object { [string]$_.Enabled -eq 'true' })
+        return [pscustomobject]@{ Total = $links.Count; Enabled = $enabled.Count; Paths = @($links | ForEach-Object { [string]$_.SOMPath }) }
+    }
+    catch {
+        return $null
+    }
+}
+
 function Remove-SrpHashBlock {
     param(
         [Parameter(Mandatory)][string]$GpoName,
@@ -1635,16 +1658,20 @@ function Update-BlockGrid {
 
 # Invoke-BlockSelected - обработчик "Заблокировать по хэшу...". Порядок действий:
 #   1) проверки (выбрана строка, указана GPO, хэш корректен, файл не в Windows\, есть модуль GroupPolicy,
-#      блокировка ещё не действует); 2) окно подтверждения; 3) правило добавляется в GPO и в журнал;
-#   4) на всех компьютерах, где файл встречался в последнем сканировании, АВТОМАТИЧЕСКИ, без отдельных флажков:
-#      обновляются политики (gpupdate - правило SRP действует немедленно, а не после планового обновления,
-#      по умолчанию до 90 минут), завершаются уже запущенные экземпляры файла, а их пользователям показывается
-#      уведомление ($script:NotifyTemplate).
+#      блокировка ещё не действует); 1а) если у GPO нет ни одной включённой привязки (Link) и поле "Привязать
+#      к" пустое - отдельное предупреждение ДО основного подтверждения: без привязки правило не подействует
+#      нигде, как бы часто ни выполнялся gpupdate; 2) окно подтверждения; 3) правило добавляется в GPO и в
+#      журнал (с тем же предупреждением, если оно относится к этому разу); 4) на всех компьютерах, где файл
+#      встречался в последнем сканировании, АВТОМАТИЧЕСКИ, без отдельных флажков: обновляются политики (gpupdate
+#      - правило SRP действует немедленно, а не после планового обновления, по умолчанию до 90 минут),
+#      завершаются уже запущенные экземпляры файла, а их пользователям показывается уведомление ($script:NotifyTemplate).
 #   Локальные: $row - выбранная строка таблицы; $algorithm / $hash / $name / $path / $size - данные файла;
-#   $gpo - имя GPO; $linkTarget - DN для привязки; $locations - где хэш найден; $computerCount - на скольких
-#   компьютерах; $notifyText - готовый текст уведомления (имя файла подставлено); $message - текст
-#   подтверждения; $ruleId - GUID созданного правила; $map - "компьютер -> пути" для применения; $loc, $key -
-#   элемент и ключ при его построении; $job - фоновое задание применения.
+#   $gpo - имя GPO; $linkTarget - DN для привязки; $linkSummary - текущие привязки GPO (Get-GpoLinkSummary,
+#   может быть $null, если проверить не удалось); $hasEnabledLink - есть ли у GPO хоть одна включённая
+#   привязка сейчас; $willBeUnlinked - после этого раза привязки по-прежнему не будет; $locations - где хэш
+#   найден; $computerCount - на скольких компьютерах; $notifyText - готовый текст уведомления (имя файла
+#   подставлено); $message - текст подтверждения; $ruleId - GUID созданного правила; $map - "компьютер -> пути"
+#   для применения; $loc, $key - элемент и ключ при его построении; $job - фоновое задание применения.
 function Invoke-BlockSelected {
     if (-not $script:ProcGrid.CurrentRow -or -not $script:ProcGrid.CurrentRow.DataBoundItem) {
         Show-Message -Text 'Выберите строку с процессом в таблице.' -Icon Warning
@@ -1681,6 +1708,24 @@ function Invoke-BlockSelected {
         return
     }
 
+    # Привязка (Link) GPO к OU/домену - то, от чего реально зависит, подействует ли правило: без привязки
+    # gpupdate на клиенте даже не возьмёт эту GPO в обработку, сколько бы хэшей в ней ни было добавлено.
+    # $linkSummary = $null значит "не удалось проверить" (например, GPO ещё не существует - тогда будет
+    # создана без привязки, если не задано -LinkTarget); $willBeUnlinked - после этого вызова привязки не будет.
+    $linkSummary = Get-GpoLinkSummary -GpoName $gpo
+    $hasEnabledLink = $linkSummary -and $linkSummary.Enabled -gt 0
+    $willBeUnlinked = -not $hasEnabledLink -and -not $linkTarget
+    if ($willBeUnlinked) {
+        Show-Message -Title 'GPO не привязана' -Icon Warning -Text (
+            "ВНИМАНИЕ: у GPO `"$gpo`" сейчас нет ни одной включённой привязки (Link) к OU или домену, и поле " +
+            "`"Привязать к`" не заполнено.`n`n" +
+            "Без привязки правило SRP НЕ ПОДЕЙСТВУЕТ ни на одном компьютере, сколько бы раз ни выполнялся gpupdate - " +
+            "клиент просто не станет обрабатывать эту GPO.`n`n" +
+            "Чтобы правило заработало: либо укажите DN нужного OU/домена в поле `"Привязать к`" на этой вкладке и " +
+            "заблокируйте ещё раз, либо привяжите GPO вручную в GPMC (ПКМ по OU -> Link an Existing GPO)."
+        )
+    }
+
     $locations = Get-HashLocations -Algorithm $algorithm -Hash $hash
     $computerCount = @($locations.Rows | ForEach-Object { $_.Computer } | Select-Object -Unique).Count
     $notifyText = $script:NotifyTemplate -f $name
@@ -1698,6 +1743,9 @@ function Invoke-BlockSelected {
         $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LinkTarget $linkTarget
         Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -GpoName $gpo -RuleId $ruleId
         Write-Log "Блокировка добавлена: $name ($algorithm $hash), GPO '$gpo', правило $ruleId"
+        if ($willBeUnlinked) {
+            Write-Log "ВНИМАНИЕ: GPO '$gpo' не привязана ни к одному OU/домену - блокировка НЕ действует, пока вы её не привяжете (поле `"Привязать к`" или вручную в GPMC)."
+        }
         Update-BlockGrid
     }
     catch {
