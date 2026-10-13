@@ -7,7 +7,8 @@
     Графическое приложение (WinForms):
       * берёт список компьютеров из AD;
       * по WinRM собирает запущенные процессы и их хэши (MD5 / SHA1 / SHA256);
-      * показывает таблицу |№|Дата|Имя|Хэш| (плюс компьютер и путь) и хранит историю в JSON-файлах;
+      * показывает таблицу |№|Время запуска процесса|Имя|Хэш| (плюс компьютер, пользователь и путь) и хранит
+        историю в JSON-файлах;
       * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO.
 
     Скрипт самодостаточный (один файл), сторонних драйверов не требует.
@@ -216,7 +217,7 @@ function New-Scan {
 
 # Save-Processes - сохраняет собранные процессы сканирования в его файл и добавляет сканирование в scans.json.
 #   Сначала пишется файл с процессами, потом индекс: сканирование "появляется" только после успешной записи обоих.
-#   Поле User (владелец процесса - пользователь, запустивший его) сохраняется вместе с процессом.
+#   Поля User (владелец процесса) и StartTime (время запуска процесса) сохраняются вместе с ним.
 #   -ScanId, -ScanDate, -Requested  данные из New-Scan; -Rows  собранные объекты с удалённых компьютеров;
 #   -Succeeded / -Failed  сколько компьютеров ответило / не ответило.
 #   Локальные: $computers - имена компьютеров, приславших данные; $list - записи процессов для файла;
@@ -238,8 +239,9 @@ function Save-Processes {
         $computers[$computer] = $true
         [void]$list.Add([ordered]@{
                 Computer = $computer
-                User     = [string]$r.User
-                Name     = [string]$r.Name
+                User      = [string]$r.User
+                StartTime = [string]$r.StartTime
+                Name      = [string]$r.Name
                 Path     = [string]$r.Path
                 Size     = [long]$r.Size
                 MD5      = ([string]$r.MD5).ToUpper()
@@ -283,10 +285,12 @@ function Get-Scans {
 # Get-ProcessTable - данные для основной таблицы процессов.
 #   -ScanId     номер сканирования; 0 - показать все сканирования (новые первыми);
 #   -Algorithm  какой хэш показывать в колонке Hash: MD5, SHA1 или SHA256.
-#   Возвращает таблицу: ScanDate, Name, Hash, Computer, User, Path, Size. User - пользователь, запустивший процесс
-#   (в сканированиях, сохранённых до появления этого поля, пусто).
+#   Возвращает таблицу: ScanDate, StartTime, Name, Hash, Computer, User, Path, Size. StartTime - когда запущен сам
+#   процесс (в часовом поясе компьютера, на котором он работает), ScanDate - когда прошло сканирование. User -
+#   пользователь, запустивший процесс. Оба поля пустые в сканированиях, сохранённых до их появления.
 #   Локальные: $table - результат; $scan - сканирование из индекса; $doc - прочитанный файл сканирования;
-#   $p - процесс из файла; $user - его пользователь. Если файл сканирования потерян, оно пропускается.
+#   $p - процесс из файла; $user / $startTime - его пользователь и время запуска. Если файл сканирования потерян,
+#   оно пропускается.
 function Get-ProcessTable {
     param(
         [int]$ScanId = 0,
@@ -294,6 +298,7 @@ function Get-ProcessTable {
     )
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('ScanDate', [string])
+    [void]$table.Columns.Add('StartTime', [string])
     [void]$table.Columns.Add('Name', [string])
     [void]$table.Columns.Add('Hash', [string])
     [void]$table.Columns.Add('Computer', [string])
@@ -308,8 +313,10 @@ function Get-ProcessTable {
         $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
         foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
             $user = ''
-            if ($p.ContainsKey('User')) { $user = [string]$p['User'] }       # старые сканирования без этого поля
-            [void]$table.Rows.Add([string]$scan['ScanDate'], [string]$p['Name'], [string]$p[$Algorithm],
+            if ($p.ContainsKey('User')) { $user = [string]$p['User'] }           # старые сканирования без этого поля
+            $startTime = ''
+            if ($p.ContainsKey('StartTime')) { $startTime = [string]$p['StartTime'] }
+            [void]$table.Rows.Add([string]$scan['ScanDate'], $startTime, [string]$p['Name'], [string]$p[$Algorithm],
                 [string]$p['Computer'], $user, [string]$p['Path'], [long]$p['Size'])
         }
     }
@@ -476,8 +483,11 @@ function Get-AdComputers {
 
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
 #   Читает Win32_Process; для каждого процесса определяет владельца (пользователя, запустившего процесс) методом
-#   GetOwner(), для каждого уникального файла считает MD5/SHA1/SHA256 за один проход чтения и возвращает объекты
-#   { Computer, User, Name, Path, Size, MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
+#   GetOwner(), берёт время его запуска (Win32_Process.CreationDate) и для каждого уникального файла считает
+#   MD5/SHA1/SHA256 за один проход чтения; возвращает объекты { Computer, User, StartTime, Name, Path, Size,
+#   MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
+#   StartTime - когда процесс был запущен ("гггг-мм-дд чч:мм:сс" в часовом поясе удалённого компьютера); если
+#   WMI не отдал время (процесс уже завершился) - пустая строка.
 #   User - "ДОМЕН\логин" владельца процесса (системные процессы: "NT AUTHORITY\SYSTEM", "NT AUTHORITY\NETWORK SERVICE" и т. п.);
 #   если владельца определить нельзя (процесс уже завершился, нет доступа) - пустая строка.
 #   Запись одна на пару "файл + владелец": если один и тот же exe запущен разными пользователями, будет несколько строк,
@@ -485,7 +495,8 @@ function Get-AdComputers {
 #   Локальные: $procs - все процессы из WMI; $cache - путь (в нижнем регистре) -> результат хэширования (или $null,
 #   если файл недоступен); $seen - уже выданные пары "путь|владелец"; $algs - три объекта хэширования;
 #   $buffer - буфер чтения 1 МБ; $proc - текущий процесс; $path - путь к exe; $key - путь в нижнем регистре;
-#   $o - результат GetOwner() (Domain, User); $owner - "ДОМЕН\логин"; $rowKey - ключ пары "путь|владелец";
+#   $o - результат GetOwner() (Domain, User); $owner - "ДОМЕН\логин"; $startTime - время запуска процесса;
+#   $rowKey - ключ пары "путь|владелец";
 #   $info - результат хэширования файла; $stream - открытый файл (читать запущенные файлы разрешено);
 #   $n - сколько байт прочитано; $a - текущий алгоритм. Недоступные файлы пропускаются.
 $script:CollectScript = {
@@ -507,6 +518,14 @@ $script:CollectScript = {
 
         $owner = ''
         try { $o = $proc.GetOwner(); if ($o.User) { $owner = $o.Domain + '\' + $o.User } } catch { }
+
+        $startTime = ''
+        try {
+            if ($proc.CreationDate) {
+                $startTime = [System.Management.ManagementDateTimeConverter]::ToDateTime($proc.CreationDate).ToString('yyyy-MM-dd HH:mm:ss')
+            }
+        }
+        catch { }
 
         $rowKey = $key + '|' + $owner.ToLower()
         if ($seen.ContainsKey($rowKey)) { continue }
@@ -543,10 +562,11 @@ $script:CollectScript = {
         if (-not $info) { continue }
 
         New-Object PSObject -Property @{
-            Computer = $env:COMPUTERNAME
-            User     = $owner
-            Name     = $proc.Name
-            Path     = $path
+            Computer  = $env:COMPUTERNAME
+            User      = $owner
+            StartTime = $startTime
+            Name      = $proc.Name
+            Path      = $path
             Size     = $info.Size
             MD5      = $info.MD5
             SHA1     = $info.SHA1
@@ -922,7 +942,7 @@ function Invoke-SelfTest {
         try {
             Initialize-Database -Path $tmp
             $rows = @(
-                [pscustomobject]@{ Computer = 'pc1'; User = 'DOM\иванов'; Name = 'тест.exe'; Path = "C:\Прог\`"тест`"`t.exe"; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
+                [pscustomobject]@{ Computer = 'pc1'; User = 'DOM\иванов'; StartTime = '2026-01-02 10:00:00'; Name = 'тест.exe'; Path = "C:\Прог\`"тест`"`t.exe"; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
                 [pscustomobject]@{ Computer = 'PC2'; Name = 'b.exe'; Path = 'C:\b.exe'; Size = 10; MD5 = 'aa'; SHA1 = 'dd'; SHA256 = 'ee' }
             )
             $scan = New-Scan -Requested 3
@@ -940,6 +960,7 @@ function Invoke-SelfTest {
             Assert-True ($ru[0].Path -ceq ('C:\Прог\"тест"' + "`t.exe")) 'кавычки, обратная косая и табуляция в пути искажены'
             Assert-True ($ru[0].Computer -eq 'PC1' -and $ru[0].Hash -eq 'AA') 'имя/хэш должны быть в верхнем регистре'
             Assert-True ($ru[0].User -ceq 'DOM\иванов') 'пользователь компьютера не сохранился'
+            Assert-True ($ru[0].StartTime -eq '2026-01-02 10:00:00') 'время запуска процесса не сохранилось'
             Assert-True (@($table.Rows | Where-Object { $_.Name -eq 'b.exe' })[0].User -eq '') 'пустой пользователь должен читаться как пустая строка'
             Assert-True ((Get-HashLocations -Algorithm MD5 -Hash 'aa').Rows.Count -eq 2) 'Get-HashLocations: ожидалось 2 места'
             Assert-True (Get-ActiveBlock -Algorithm MD5 -Hash 'AA') 'активная блокировка не найдена после перезагрузки'
@@ -961,6 +982,8 @@ function Invoke-SelfTest {
         $mine = @($collected | Where-Object { $_.Path -ieq $self })
         Assert-True ($mine.Count -ge 1) "не найден собственный процесс: $self"
         Assert-True ($mine[0].PSObject.Properties.Name -contains 'User') 'в результате сбора нет поля User'
+        Assert-True ($mine[0].PSObject.Properties.Name -contains 'StartTime') 'в результате сбора нет поля StartTime'
+        Assert-True ([string]$mine[0].StartTime) 'не определилось время запуска собственного процесса'
         foreach ($alg in 'MD5', 'SHA1', 'SHA256') {
             $ref = (Get-FileHash -LiteralPath $self -Algorithm $alg).Hash
             Assert-True ($mine[0].$alg -eq $ref) "$alg не совпал с Get-FileHash"
@@ -1235,7 +1258,7 @@ $tabComputers.Controls.Add($compBar)
 #   $procBar - панель инструментов; $script:ScanCombo - выбор сканирования ("Все сканирования" или конкретное);
 #   $script:AlgoCombo - какой хэш показывать и использовать для блокировки (MD5/SHA1/SHA256);
 #   $script:FilterBox - поиск по имени, хэшу, компьютеру, пользователю и пути; $btnRefresh - "Обновить" (перечитать данные);
-#   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, Дата, Имя, Хэш, Компьютер, Пользователь, Путь).
+#   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, время запуска процесса, Имя, Хэш, Компьютер, Пользователь, Путь).
 $procBar = New-Toolbar
 $script:ScanCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 260; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
 $script:AlgoCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 80; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
@@ -1248,7 +1271,7 @@ $procBar.Controls.AddRange(@((New-Label 'Сканирование:'), $script:Sc
         (New-Label 'Поиск:'), $script:FilterBox, $btnRefresh, $btnBlock))
 
 $script:ProcGrid = New-Grid
-Add-GridColumn $script:ProcGrid 'Дата' 'ScanDate' 140
+Add-GridColumn $script:ProcGrid 'Запуск процесса' 'StartTime' 150
 Add-GridColumn $script:ProcGrid 'Имя' 'Name' 180
 Add-GridColumn $script:ProcGrid 'Хэш' 'Hash' 330 -Mono
 Add-GridColumn $script:ProcGrid 'Компьютер' 'Computer' 130
