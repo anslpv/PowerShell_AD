@@ -85,6 +85,22 @@ catch {
     $script:JsonSerializer = $null
 }
 
+# $script:JsonEscapeRegex / $script:JsonEscape - экранирование строк для JSON: регулярное выражение находит символы \ " и
+#   управляющие (код меньше 32), а обработчик $script:JsonEscape заменяет каждый на \\ \" \n \r \t или \uXXXX.
+#   Всё остальное (кириллица, эмодзи) пишется как есть - файл в UTF-8.
+$script:JsonEscapeRegex = New-Object System.Text.RegularExpressions.Regex('[\\"\x00-\x1f]')
+$script:JsonEscape = [System.Text.RegularExpressions.MatchEvaluator]{
+    param($m)
+    switch -CaseSensitive ($m.Value) {
+        '\' { '\\' }
+        '"' { '\"' }
+        "`n" { '\n' }
+        "`r" { '\r' }
+        "`t" { '\t' }
+        default { '\u{0:x4}' -f [int][char]$m.Value }
+    }
+}
+
 # Write-JsonValue - дописывает в StringBuilder значение в формате JSON. Рекурсивно обходит словари (IDictionary ->
 #   объект {...}), списки и массивы (IEnumerable -> [...]); строки экранируются, числа пишутся в инвариантной культуре.
 #   Это собственный сериализатор, а не JavaScriptSerializer: в Windows PowerShell 5.1 тот пытается сериализовать
@@ -98,9 +114,7 @@ function Write-JsonValue {
     $Value = $Value.psobject.BaseObject      # снять PowerShell-обёртку (.BaseObject напрямую на списках перечислялся бы по элементам)
 
     if ($Value -is [string]) {
-        $t = $Value.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t')
-        if ($t -match '[\x00-\x1f]') { $t = [regex]::Replace($t, '[\x00-\x1f]', { param($m) '\u{0:x4}' -f [int][char]$m.Value }) }
-        [void]$Sb.Append('"').Append($t).Append('"')
+        [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace($Value, $script:JsonEscape)).Append('"')
         return
     }
     if ($Value -is [bool]) { [void]$Sb.Append($(if ($Value) { 'true' } else { 'false' })); return }
@@ -110,13 +124,9 @@ function Write-JsonValue {
         foreach ($e in $Value.GetEnumerator()) {
             if (-not $first) { [void]$Sb.Append(',') }
             $first = $false
-            [void]$Sb.Append('"').Append(([string]$e.Key).Replace('\', '\\').Replace('"', '\"')).Append('":')     # имена полей - обычные идентификаторы
+            [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace([string]$e.Key, $script:JsonEscape)).Append('":')
             $v = $e.Value
-            if ($v -is [string]) {
-                $t = $v.Replace('\', '\\').Replace('"', '\"')
-                if ($t -match '[\x00-\x1f]') { Write-JsonValue -Value $v -Sb $Sb }
-                else { [void]$Sb.Append('"').Append($t).Append('"') }
-            }
+            if ($v -is [string]) { [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace($v, $script:JsonEscape)).Append('"') }
             elseif ($v -is [long] -or $v -is [int]) { [void]$Sb.Append($v.ToString([System.Globalization.CultureInfo]::InvariantCulture)) }
             else { Write-JsonValue -Value $v -Sb $Sb }
         }
@@ -202,8 +212,7 @@ function Write-JsonFile {
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $tmp = $Path + '.tmp'
     [System.IO.File]::WriteAllText($tmp, (ConvertTo-JsonText -Data $Data), (New-Object System.Text.UTF8Encoding($false)))
-    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }    # без резервной копии
-    else { [System.IO.File]::Move($tmp, $Path) }
+    Move-Item -LiteralPath $tmp -Destination $Path -Force      # -Force: заменить существующий файл
 }
 
 # Get-JsonList - достаёт из прочитанного документа список по ключу. Если документа или ключа нет - пустой массив.
@@ -1005,7 +1014,7 @@ try {
     Initialize-Database -Path $DataPath
 }
 catch {
-    Show-Message -Text "Не удалось открыть хранилище данных:`n$($_.Exception.Message)" -Icon Error
+    Show-Message -Text "Не удалось открыть хранилище данных:`n$($_.Exception.Message)`n`nГде: $($_.InvocationInfo.PositionMessage)`n$($_.ScriptStackTrace)" -Icon Error
     exit 1
 }
 
@@ -1069,9 +1078,15 @@ function New-Grid {
     $g.Add_CellFormatting({
             param($sender, $e)
             if ($e.ColumnIndex -eq 0 -and $e.RowIndex -ge 0) {
-                $e.Value = $e.RowIndex + 1
+                # Именно строка: при FormattingApplied = $true таблица ждёт уже готовый текст, а число даёт FormatException.
+                $e.Value = [string]($e.RowIndex + 1)
                 $e.FormattingApplied = $true
             }
+        })
+    # Ошибки отображения данных не должны сыпать окнами "Исключение в DataGridView" - просто пропускаем.
+    $g.Add_DataError({
+            param($sender, $e)
+            $e.ThrowException = $false
         })
     return $g
 }
