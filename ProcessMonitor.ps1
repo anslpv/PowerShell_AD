@@ -831,6 +831,34 @@ function Remove-SrpHashBlock {
 
 
 # ===========================================================================
+# Журнал в файле
+# ===========================================================================
+
+# $script:LogFile - файл журнала на диске (data\logs\processmonitor.log). Записи ДОБАВЛЯЮТСЯ в конец и не стираются
+#   при перезапуске программы; при размере больше 5 МБ файл переименовывается в processmonitor.log.1 (старый .1 заменяется).
+$script:LogFile = Join-Path $DataPath 'logs\processmonitor.log'
+
+# Write-LogFile - дописывает сообщение в файл журнала со строкой даты и времени "гггг-мм-дд чч:мм:сс  сообщение".
+#   -Message текст; -Time время записи. Файл в UTF-8 с BOM (корректно открывается Блокнотом). Любая ошибка записи
+#   (нет прав, файл занят) молча игнорируется: журнал не должен ронять программу.
+#   Локальные: $dir - папка журнала; $info - сведения о файле (для проверки размера).
+function Write-LogFile {
+    param([string]$Message, [datetime]$Time = (Get-Date))
+    if (-not $script:LogFile) { return }
+    try {
+        $dir = Split-Path -Parent $script:LogFile
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $info = Get-Item -LiteralPath $script:LogFile -ErrorAction SilentlyContinue
+        if ($info -and $info.Length -gt 5MB) { Move-Item -LiteralPath $script:LogFile -Destination ($script:LogFile + '.1') -Force }
+        $line = '{0}  {1}{2}' -f $Time.ToString('yyyy-MM-dd HH:mm:ss'), $Message, [Environment]::NewLine
+        [System.IO.File]::AppendAllText($script:LogFile, $line, (New-Object System.Text.UTF8Encoding($true)))
+    }
+    catch {
+        # ничего: журнал вспомогательный
+    }
+}
+
+# ===========================================================================
 # Самопроверка (запуск: .\ProcessMonitor.ps1 -SelfTest)
 # ===========================================================================
 
@@ -888,6 +916,21 @@ function Invoke-SelfTest {
         [IO.File]::WriteAllText($probe, 'ok')
         Remove-Item -LiteralPath $probe -Force
         $DataPath
+    }
+    Test-Step 'Запись журнала в файл (дописывание, кириллица)' {
+        $oldLog = $script:LogFile
+        $script:LogFile = Join-Path ([IO.Path]::GetTempPath()) ('pm-log-' + [Guid]::NewGuid().ToString('N') + '\test.log')
+        try {
+            Write-LogFile -Message 'первая запись'
+            Write-LogFile -Message 'вторая запись'
+            $text = [IO.File]::ReadAllText($script:LogFile, [Text.Encoding]::UTF8)
+            Assert-True ($text -match 'первая запись' -and $text -match 'вторая запись') 'записи не сохранились или кириллица искажена'
+            Assert-True (@($text -split "`n" | Where-Object { $_ }).Count -eq 2) 'вторая запись затёрла первую вместо дописывания'
+        }
+        finally {
+            Remove-Item -LiteralPath (Split-Path -Parent $script:LogFile) -Recurse -Force -ErrorAction SilentlyContinue
+            $script:LogFile = $oldLog
+        }
     }
     Test-Step 'Сериализатор JSON' {
         if ($PSVersionTable.PSEdition -eq 'Desktop') {
@@ -1142,10 +1185,35 @@ $script:LogBox = New-Object System.Windows.Forms.TextBox -Property @{
 }
 $tabLog.Controls.Add($script:LogBox)
 
-# Write-Log - добавляет строку "чч:мм:сс  сообщение" в журнал. -Message текст сообщения.
+# Панель вкладки "Журнал": $logBar - панель; $btnOpenLog - "Открыть файл журнала" (открывает файл в Блокноте).
+$logBar = New-Toolbar
+$btnOpenLog = New-Button 'Открыть файл журнала' 190
+$logBar.Controls.Add($btnOpenLog)
+$tabLog.Controls.Add($logBar)
+
+# Write-Log - пишет сообщение сразу в два места: в окно (строка "чч:мм:сс  сообщение") и в файл журнала (Write-LogFile).
+#   -Message текст сообщения. $now - момент записи (одинаков для окна и файла).
 function Write-Log {
     param([string]$Message)
-    $script:LogBox.AppendText(('{0}  {1}{2}' -f (Get-Date).ToString('HH:mm:ss'), $Message, [Environment]::NewLine))
+    $now = Get-Date
+    if ($script:LogBox) { $script:LogBox.AppendText(('{0}  {1}{2}' -f $now.ToString('HH:mm:ss'), $Message, [Environment]::NewLine)) }
+    Write-LogFile -Message $Message -Time $now
+}
+
+# Import-LogHistory - при запуске показывает в окне последние записи из файла журнала (по умолчанию 200 строк),
+#   чтобы история не пропадала после перезапуска. -Last сколько последних строк показать. $lines - прочитанные строки.
+function Import-LogHistory {
+    param([int]$Last = 200)
+    if (-not $script:LogFile -or -not (Test-Path -LiteralPath $script:LogFile)) { return }
+    try {
+        $lines = @(Get-Content -LiteralPath $script:LogFile -Tail $Last -Encoding UTF8)
+        if ($lines.Count -gt 0) {
+            $script:LogBox.AppendText(('--- предыдущие записи из файла (последние {0}) ---{1}{2}{1}--- текущий запуск ---{1}' -f $lines.Count, [Environment]::NewLine, ($lines -join [Environment]::NewLine)))
+        }
+    }
+    catch {
+        # не удалось прочитать историю - не страшно
+    }
 }
 
 # Set-Status - выводит текст в строке состояния окна. -Text текст.
@@ -1681,6 +1749,10 @@ $script:FilterBox.Add_TextChanged({ Update-ProcessFilter })
 $btnRefresh.Add_Click({ Update-ScanList })
 $btnBlock.Add_Click({ Invoke-BlockSelected })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
+$btnOpenLog.Add_Click({
+        if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
+        else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
+    })
 
 $script:Form.Add_FormClosing({
         $script:Timer.Stop()
@@ -1693,7 +1765,10 @@ $script:Form.Add_FormClosing({
 $script:Form.Add_Shown({
         Update-ScanList
         Update-BlockGrid
+        Import-LogHistory
+        Write-Log ('=== Запуск Process Monitor (PowerShell {0}, пользователь {1}\{2}) ===' -f $PSVersionTable.PSVersion, $env:USERDOMAIN, $env:USERNAME)
         Write-Log "Данные: $DataPath"
+        Write-Log "Файл журнала: $($script:LogFile)"
         if (-not (Test-GroupPolicyModule)) {
             Write-Log 'Внимание: модуль GroupPolicy (RSAT) не найден - блокировка будет недоступна.'
         }
