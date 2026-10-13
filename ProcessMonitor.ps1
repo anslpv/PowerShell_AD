@@ -70,8 +70,8 @@ $DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSP
 # $script:Blocks   - журнал блокировок из blocks.json в памяти (ArrayList словарей: Id, BlockDate, Name, Algorithm,
 #                    Hash, Size, GpoName, RuleId, Active).
 # $script:JsonSerializer - JavaScriptSerializer из .NET Framework, используется ТОЛЬКО для чтения JSON (быстро и даёт чистые
-#                    .NET-словари). Для записи применяется собственный Write-JsonValue. Если JavaScriptSerializer
-#                    недоступен (например, при проверке на PowerShell 7), чтение идёт через ConvertFrom-Json.
+#                    .NET-словари). Запись идёт через ConvertTo-Json. Если JavaScriptSerializer недоступен или
+#                    сбойнул (например, при проверке на PowerShell 7), чтение идёт через ConvertFrom-Json.
 $script:StoreDir = $null
 $script:Scans = $null
 $script:Blocks = $null
@@ -85,79 +85,14 @@ catch {
     $script:JsonSerializer = $null
 }
 
-# $script:JsonEscapeRegex / $script:JsonEscape - экранирование строк для JSON: регулярное выражение находит символы \ " и
-#   управляющие (код меньше 32), а обработчик $script:JsonEscape заменяет каждый на \\ \" \n \r \t или \uXXXX.
-#   Всё остальное (кириллица, эмодзи) пишется как есть - файл в UTF-8.
-$script:JsonEscapeRegex = New-Object System.Text.RegularExpressions.Regex('[\\"\x00-\x1f]')
-$script:JsonEscape = [System.Text.RegularExpressions.MatchEvaluator]{
-    param($m)
-    switch -CaseSensitive ($m.Value) {
-        '\' { '\\' }
-        '"' { '\"' }
-        "`n" { '\n' }
-        "`r" { '\r' }
-        "`t" { '\t' }
-        default { '\u{0:x4}' -f [int][char]$m.Value }
-    }
-}
-
-# Write-JsonValue - дописывает в StringBuilder значение в формате JSON. Рекурсивно обходит словари (IDictionary ->
-#   объект {...}), списки и массивы (IEnumerable -> [...]); строки экранируются, числа пишутся в инвариантной культуре.
-#   Это собственный сериализатор, а не JavaScriptSerializer: в Windows PowerShell 5.1 тот пытается сериализовать
-#   PowerShell-обёртку (PSObject / PSParameterizedProperty) и падает с "обнаружена циклическая ссылка".
-#   -Value что записать (словарь, список, строка, число, bool, $null); -Sb куда дописывать.
-#   Для скорости строки и числа внутри словаря пишутся прямо в цикле, без отдельного вызова функции.
-#   Локальные: $e - запись словаря; $v - её значение; $item - элемент списка; $first - "первый элемент" (для запятых).
-function Write-JsonValue {
-    param($Value, [System.Text.StringBuilder]$Sb)
-    if ($null -eq $Value) { [void]$Sb.Append('null'); return }
-    $Value = $Value.psobject.BaseObject      # снять PowerShell-обёртку (.BaseObject напрямую на списках перечислялся бы по элементам)
-
-    if ($Value -is [string]) {
-        [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace($Value, $script:JsonEscape)).Append('"')
-        return
-    }
-    if ($Value -is [bool]) { [void]$Sb.Append($(if ($Value) { 'true' } else { 'false' })); return }
-    if ($Value -is [System.Collections.IDictionary]) {
-        [void]$Sb.Append('{')
-        $first = $true
-        foreach ($e in $Value.GetEnumerator()) {
-            if (-not $first) { [void]$Sb.Append(',') }
-            $first = $false
-            [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace([string]$e.Key, $script:JsonEscape)).Append('":')
-            $v = $e.Value
-            if ($v -is [string]) { [void]$Sb.Append('"').Append($script:JsonEscapeRegex.Replace($v, $script:JsonEscape)).Append('"') }
-            elseif ($v -is [long] -or $v -is [int]) { [void]$Sb.Append($v.ToString([System.Globalization.CultureInfo]::InvariantCulture)) }
-            else { Write-JsonValue -Value $v -Sb $Sb }
-        }
-        [void]$Sb.Append('}')
-        return
-    }
-    if ($Value -is [System.Collections.IEnumerable]) {
-        [void]$Sb.Append('[')
-        $first = $true
-        foreach ($item in $Value) {
-            if (-not $first) { [void]$Sb.Append(',') }
-            $first = $false
-            Write-JsonValue -Value $item -Sb $Sb
-        }
-        [void]$Sb.Append(']')
-        return
-    }
-    if ($Value -is [ValueType] -and $Value -isnot [char] -and $Value -isnot [datetime] -and $Value -isnot [enum]) {
-        [void]$Sb.Append([Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture))
-        return
-    }
-    Write-JsonValue -Value ([string]$Value) -Sb $Sb      # всё прочее (даты, символы, перечисления) - как строка
-}
-
-# ConvertTo-JsonText - превращает данные (словари, списки, строки, числа) в текст JSON через Write-JsonValue.
-#   -Data что сериализовать. $sb - накапливаемый текст.
+# ConvertTo-JsonText - превращает данные (словари, списки, строки, числа) в компактный текст JSON штатным ConvertTo-Json.
+#   Раньше здесь был собственный сериализатор и JavaScriptSerializer, но в Windows PowerShell 5.1 они падали (циклическая
+#   ссылка на PowerShell-обёртку, ошибки вызова методов): штатный командлет с обёртками PowerShell справляется сам.
+#   -InputObject (а не конвейер) нужен, чтобы список из одного элемента не превращался в объект.
+#   -Depth 10 - глубина вложенности с запасом (у нас не больше 4). -Data что сериализовать.
 function ConvertTo-JsonText {
     param([Parameter(Mandatory)]$Data)
-    $sb = New-Object System.Text.StringBuilder
-    Write-JsonValue -Value $Data -Sb $sb
-    return $sb.ToString()
+    return (ConvertTo-Json -InputObject $Data -Depth 10 -Compress)
 }
 
 # ConvertTo-PlainData - превращает результат ConvertFrom-Json (PSCustomObject и массивы) в хэш-таблицы и ArrayList,
@@ -180,11 +115,15 @@ function ConvertTo-PlainData {
 }
 
 # ConvertFrom-JsonText - превращает текст JSON в словари и массивы (объект JSON -> словарь, доступ $d['Ключ']).
-#   Читает JavaScriptSerializer.DeserializeObject (быстро, возвращает чистые .NET-типы). Если его нет - ConvertFrom-Json
-#   (на PowerShell 6+ с -AsHashtable, на 5.1 с преобразованием через ConvertTo-PlainData). -Text строка с JSON.
+#   Сначала пробует быстрый JavaScriptSerializer.DeserializeObject (чистые .NET-типы); если его нет или он сбойнул -
+#   ConvertFrom-Json (на PowerShell 6+ с -AsHashtable, на 5.1 с преобразованием через ConvertTo-PlainData).
+#   -Text строка с JSON.
 function ConvertFrom-JsonText {
     param([Parameter(Mandatory)][string]$Text)
-    if ($script:JsonSerializer) { return $script:JsonSerializer.DeserializeObject($Text) }
+    if ($script:JsonSerializer) {
+        try { return $script:JsonSerializer.DeserializeObject($Text) }
+        catch { }       # переходим к запасному варианту ниже
+    }
     if ($PSVersionTable.PSVersion.Major -ge 6) { return (ConvertFrom-Json -InputObject $Text -AsHashtable) }
     return (ConvertTo-PlainData -Value (ConvertFrom-Json -InputObject $Text))
 }
@@ -1769,6 +1708,11 @@ $script:Form.Add_Shown({
         Write-Log ('=== Запуск Process Monitor (PowerShell {0}, пользователь {1}\{2}) ===' -f $PSVersionTable.PSVersion, $env:USERDOMAIN, $env:USERNAME)
         Write-Log "Данные: $DataPath"
         Write-Log "Файл журнала: $($script:LogFile)"
+        try {
+            $self = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
+            Write-Log ('Файл скрипта: {0}, строк {1}, SHA256 {2}' -f $self, @(Get-Content -LiteralPath $self).Count, (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.Substring(0, 16))
+        }
+        catch { }
         if (-not (Test-GroupPolicyModule)) {
             Write-Log 'Внимание: модуль GroupPolicy (RSAT) не найден - блокировка будет недоступна.'
         }
