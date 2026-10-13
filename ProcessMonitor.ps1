@@ -216,6 +216,7 @@ function New-Scan {
 
 # Save-Processes - сохраняет собранные процессы сканирования в его файл и добавляет сканирование в scans.json.
 #   Сначала пишется файл с процессами, потом индекс: сканирование "появляется" только после успешной записи обоих.
+#   Поле User (пользователь компьютера) сохраняется вместе с процессом.
 #   -ScanId, -ScanDate, -Requested  данные из New-Scan; -Rows  собранные объекты с удалённых компьютеров;
 #   -Succeeded / -Failed  сколько компьютеров ответило / не ответило.
 #   Локальные: $computers - имена компьютеров, приславших данные; $list - записи процессов для файла;
@@ -237,6 +238,7 @@ function Save-Processes {
         $computers[$computer] = $true
         [void]$list.Add([ordered]@{
                 Computer = $computer
+                User     = [string]$r.User
                 Name     = [string]$r.Name
                 Path     = [string]$r.Path
                 Size     = [long]$r.Size
@@ -281,9 +283,10 @@ function Get-Scans {
 # Get-ProcessTable - данные для основной таблицы процессов.
 #   -ScanId     номер сканирования; 0 - показать все сканирования (новые первыми);
 #   -Algorithm  какой хэш показывать в колонке Hash: MD5, SHA1 или SHA256.
-#   Возвращает таблицу: ScanDate, Name, Hash, Computer, Path, Size.
+#   Возвращает таблицу: ScanDate, Name, Hash, Computer, User, Path, Size. User - пользователь компьютера на момент
+#   сканирования (в сканированиях, сохранённых до появления этого поля, пусто).
 #   Локальные: $table - результат; $scan - сканирование из индекса; $doc - прочитанный файл сканирования;
-#   $p - процесс из файла. Если файл сканирования потерян, оно пропускается.
+#   $p - процесс из файла; $user - его пользователь. Если файл сканирования потерян, оно пропускается.
 function Get-ProcessTable {
     param(
         [int]$ScanId = 0,
@@ -294,6 +297,7 @@ function Get-ProcessTable {
     [void]$table.Columns.Add('Name', [string])
     [void]$table.Columns.Add('Hash', [string])
     [void]$table.Columns.Add('Computer', [string])
+    [void]$table.Columns.Add('User', [string])
     [void]$table.Columns.Add('Path', [string])
     [void]$table.Columns.Add('Size', [long])
 
@@ -303,8 +307,10 @@ function Get-ProcessTable {
         if ($ScanId -gt 0 -and [int]$scan['Id'] -ne $ScanId) { continue }
         $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
         foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
+            $user = ''
+            if ($p.ContainsKey('User')) { $user = [string]$p['User'] }       # старые сканирования без этого поля
             [void]$table.Rows.Add([string]$scan['ScanDate'], [string]$p['Name'], [string]$p[$Algorithm],
-                [string]$p['Computer'], [string]$p['Path'], [long]$p['Size'])
+                [string]$p['Computer'], $user, [string]$p['Path'], [long]$p['Size'])
         }
     }
     $table.EndLoadData()
@@ -470,11 +476,17 @@ function Get-AdComputers {
 
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
 #   Читает Win32_Process, для каждого уникального файла считает MD5/SHA1/SHA256 за один проход чтения
-#   и возвращает объекты { Computer, Name, Path, Size, MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
+#   и возвращает объекты { Computer, User, Name, Path, Size, MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
+#   User - кто сейчас работает на компьютере: владельцы процессов explorer.exe (он запущен в каждом интерактивном
+#   сеансе, поэтому видны и консоль, и RDP), в виде "ДОМЕН\логин"; несколько пользователей - через запятую; если
+#   explorer.exe нет (например, Server Core), берётся Win32_ComputerSystem.UserName; если никого нет - пустая строка.
+#   Одно значение User одинаково для всех процессов этого компьютера.
 #   Локальные: $seen - уже обработанные пути (один файл считается один раз); $algs - три объекта хэширования;
 #   $buffer - буфер чтения 1 МБ; $proc - процесс из WMI; $path - путь к exe; $key - путь в нижнем регистре;
 #   $stream - открытый файл (разрешено читать запущенные файлы); $n - сколько байт прочитано;
 #   $a - текущий алгоритм; $size - размер файла. Недоступные файлы пропускаются.
+#   $procs - все процессы из WMI; $users - найденные пользователи (ключи); $ep - процесс при поиске explorer.exe;
+#   $o - результат GetOwner() (Domain, User); $cs - Win32_ComputerSystem; $userText - итоговая строка пользователей.
 $script:CollectScript = {
     $ErrorActionPreference = 'Stop'
     $seen = @{}
@@ -485,7 +497,19 @@ $script:CollectScript = {
     }
     $buffer = New-Object byte[] 1048576
 
-    foreach ($proc in (Get-WmiObject -Class Win32_Process)) {
+    $procs = @(Get-WmiObject -Class Win32_Process)
+    $users = @{}
+    foreach ($ep in $procs) {
+        if ($ep.Name -ieq 'explorer.exe') {
+            try { $o = $ep.GetOwner(); if ($o.User) { $users[($o.Domain + '\' + $o.User)] = $true } } catch { }
+        }
+    }
+    if ($users.Count -eq 0) {
+        try { $cs = Get-WmiObject -Class Win32_ComputerSystem; if ($cs.UserName) { $users[[string]$cs.UserName] = $true } } catch { }
+    }
+    $userText = (@($users.Keys | Sort-Object) -join ', ')
+
+    foreach ($proc in $procs) {
         $path = $proc.ExecutablePath
         if (-not $path) { continue }
         $key = $path.ToLower()
@@ -513,6 +537,7 @@ $script:CollectScript = {
 
         New-Object PSObject -Property @{
             Computer = $env:COMPUTERNAME
+            User     = $userText
             Name     = $proc.Name
             Path     = $path
             Size     = $size
@@ -890,7 +915,7 @@ function Invoke-SelfTest {
         try {
             Initialize-Database -Path $tmp
             $rows = @(
-                [pscustomobject]@{ Computer = 'pc1'; Name = 'тест.exe'; Path = "C:\Прог\`"тест`"`t.exe"; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
+                [pscustomobject]@{ Computer = 'pc1'; User = 'DOM\иванов'; Name = 'тест.exe'; Path = "C:\Прог\`"тест`"`t.exe"; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
                 [pscustomobject]@{ Computer = 'PC2'; Name = 'b.exe'; Path = 'C:\b.exe'; Size = 10; MD5 = 'aa'; SHA1 = 'dd'; SHA256 = 'ee' }
             )
             $scan = New-Scan -Requested 3
@@ -907,6 +932,8 @@ function Invoke-SelfTest {
             Assert-True ($ru[0].Size -eq 5GB) 'размер больше 4 ГБ искажён'
             Assert-True ($ru[0].Path -ceq ('C:\Прог\"тест"' + "`t.exe")) 'кавычки, обратная косая и табуляция в пути искажены'
             Assert-True ($ru[0].Computer -eq 'PC1' -and $ru[0].Hash -eq 'AA') 'имя/хэш должны быть в верхнем регистре'
+            Assert-True ($ru[0].User -ceq 'DOM\иванов') 'пользователь компьютера не сохранился'
+            Assert-True (@($table.Rows | Where-Object { $_.Name -eq 'b.exe' })[0].User -eq '') 'пустой пользователь должен читаться как пустая строка'
             Assert-True ((Get-HashLocations -Algorithm MD5 -Hash 'aa').Rows.Count -eq 2) 'Get-HashLocations: ожидалось 2 места'
             Assert-True (Get-ActiveBlock -Algorithm MD5 -Hash 'AA') 'активная блокировка не найдена после перезагрузки'
             Disable-BlockRecord -Id 1
@@ -926,11 +953,12 @@ function Invoke-SelfTest {
         Assert-True ($collected.Count -gt 0) 'не получено ни одного процесса (Win32_Process)'
         $mine = @($collected | Where-Object { $_.Path -ieq $self })
         Assert-True ($mine.Count -eq 1) "не найден собственный процесс: $self"
+        Assert-True ($mine[0].PSObject.Properties.Name -contains 'User') 'в результате сбора нет поля User'
         foreach ($alg in 'MD5', 'SHA1', 'SHA256') {
             $ref = (Get-FileHash -LiteralPath $self -Algorithm $alg).Hash
             Assert-True ($mine[0].$alg -eq $ref) "$alg не совпал с Get-FileHash"
         }
-        'процессов с путями: ' + $collected.Count
+        'процессов с путями: ' + $collected.Count + ', пользователь: ' + $(if ($mine[0].User) { $mine[0].User } else { '(никого не найдено)' })
     }
     Test-Step 'Windows Forms (создание окна и таблицы без показа)' {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -1197,8 +1225,8 @@ $tabComputers.Controls.Add($compBar)
 # Вкладка "Процессы":
 #   $procBar - панель инструментов; $script:ScanCombo - выбор сканирования ("Все сканирования" или конкретное);
 #   $script:AlgoCombo - какой хэш показывать и использовать для блокировки (MD5/SHA1/SHA256);
-#   $script:FilterBox - поиск по имени, хэшу, компьютеру и пути; $btnRefresh - "Обновить" (перечитать данные);
-#   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, Дата, Имя, Хэш, Компьютер, Путь).
+#   $script:FilterBox - поиск по имени, хэшу, компьютеру, пользователю и пути; $btnRefresh - "Обновить" (перечитать данные);
+#   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, Дата, Имя, Хэш, Компьютер, Пользователь, Путь).
 $procBar = New-Toolbar
 $script:ScanCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 260; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
 $script:AlgoCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 80; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
@@ -1215,6 +1243,7 @@ Add-GridColumn $script:ProcGrid 'Дата' 'ScanDate' 140
 Add-GridColumn $script:ProcGrid 'Имя' 'Name' 180
 Add-GridColumn $script:ProcGrid 'Хэш' 'Hash' 330 -Mono
 Add-GridColumn $script:ProcGrid 'Компьютер' 'Computer' 130
+Add-GridColumn $script:ProcGrid 'Пользователь' 'User' 170
 Add-GridColumn $script:ProcGrid 'Путь' 'Path' 300 -Fill
 
 $tabProcesses.Controls.Add($script:ProcGrid)
@@ -1498,7 +1527,7 @@ function Update-ProcessFilter {
     $text = $script:FilterBox.Text.Trim()
     if ($text) {
         $like = ConvertTo-RowFilterLike -Text $text
-        $script:ProcView.RowFilter = "Name LIKE '%$like%' OR Hash LIKE '%$like%' OR Computer LIKE '%$like%' OR Path LIKE '%$like%'"
+        $script:ProcView.RowFilter = "Name LIKE '%$like%' OR Hash LIKE '%$like%' OR Computer LIKE '%$like%' OR User LIKE '%$like%' OR Path LIKE '%$like%'"
     }
     else {
         $script:ProcView.RowFilter = ''
