@@ -54,7 +54,7 @@ $DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSP
 # Хранилище данных (JSON-файлы)
 # ===========================================================================
 
-# Что лежит в папке данных ($script:DataPath, по умолчанию data\ рядом со скриптом):
+# Что лежит в папке данных ($script:StoreDir, по умолчанию data\ рядом со скриптом):
 #   scans.json              - список сканирований: номер, дата, сколько компьютеров опрошено / ответило / не ответило,
 #                             имена ответивших компьютеров;
 #   scans\scan-000001.json  - процессы одного сканирования (по файлу на каждое сканирование);
@@ -63,14 +63,15 @@ $DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSP
 # файл (.tmp) с последующей заменой, поэтому обрыв посреди записи не портит уже сохранённые данные.
 # Приложение рассчитано на один запущенный экземпляр: одновременная запись из двух окон не поддерживается.
 
-# $script:DataPath - папка с JSON-файлами; заполняется в Initialize-Database.
+# $script:StoreDir - папка с JSON-файлами; заполняется в Initialize-Database. (Имя НЕ должно совпадать с параметром
+#                    скрипта $DataPath: $script:DataPath - это та же самая переменная, и присваивание затёрло бы параметр.)
 # $script:Scans    - список сканирований из scans.json, держится в памяти (ArrayList словарей: Id, ScanDate, Requested,
 #                    Succeeded, Failed, Computers). Процессы в память целиком не загружаются - читаются по запросу.
 # $script:Blocks   - журнал блокировок из blocks.json в памяти (ArrayList словарей: Id, BlockDate, Name, Algorithm,
 #                    Hash, Size, GpoName, RuleId, Active).
 # $script:JsonSerializer - быстрый сериализатор JSON из .NET Framework (JavaScriptSerializer). Если он недоступен
 #                    (например, при проверке на PowerShell 7), используются ConvertTo-Json / ConvertFrom-Json.
-$script:DataPath = $null
+$script:StoreDir = $null
 $script:Scans = $null
 $script:Blocks = $null
 $script:JsonSerializer = $null
@@ -140,7 +141,7 @@ function Initialize-Database {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
-    $script:DataPath = $Path
+    $script:StoreDir = $Path
     $script:Scans = New-Object System.Collections.ArrayList
     $script:Blocks = New-Object System.Collections.ArrayList
 
@@ -157,18 +158,18 @@ function Initialize-Database {
 
 # Save-ScanIndex - записывает список сканирований из памяти в scans.json.
 function Save-ScanIndex {
-    Write-JsonFile -Path (Join-Path $script:DataPath 'scans.json') -Data ([ordered]@{ Version = 1; Scans = $script:Scans })
+    Write-JsonFile -Path (Join-Path $script:StoreDir 'scans.json') -Data ([ordered]@{ Version = 1; Scans = $script:Scans })
 }
 
 # Save-BlockLog - записывает журнал блокировок из памяти в blocks.json.
 function Save-BlockLog {
-    Write-JsonFile -Path (Join-Path $script:DataPath 'blocks.json') -Data ([ordered]@{ Version = 1; Blocks = $script:Blocks })
+    Write-JsonFile -Path (Join-Path $script:StoreDir 'blocks.json') -Data ([ordered]@{ Version = 1; Blocks = $script:Blocks })
 }
 
 # Get-ScanFilePath - путь к файлу с процессами сканирования: <данные>\scans\scan-000001.json. -Id номер сканирования.
 function Get-ScanFilePath {
     param([Parameter(Mandatory)][int]$Id)
-    Join-Path (Join-Path $script:DataPath 'scans') ('scan-{0:D6}.json' -f $Id)
+    Join-Path (Join-Path $script:StoreDir 'scans') ('scan-{0:D6}.json' -f $Id)
 }
 
 # ---- Сканирования и процессы -------------------------------------------------
@@ -790,6 +791,14 @@ function Invoke-SelfTest {
     }
     Test-Step 'Режим потока STA (нужен для окна)' {
         Assert-True ([Threading.Thread]::CurrentThread.GetApartmentState() -eq [Threading.ApartmentState]::STA) 'поток не STA - запускайте через powershell.exe -STA'
+    }
+    Test-Step 'Папка данных определена и доступна для записи' {
+        Assert-True $DataPath 'путь к папке данных пуст ($DataPath)'
+        if (-not (Test-Path -LiteralPath $DataPath)) { New-Item -ItemType Directory -Path $DataPath -Force | Out-Null }
+        $probe = Join-Path $DataPath ('.write-test-' + [Guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($probe, 'ok')
+        Remove-Item -LiteralPath $probe -Force
+        $DataPath
     }
     Test-Step 'Сериализатор JSON' {
         if ($PSVersionTable.PSEdition -eq 'Desktop') {
