@@ -28,7 +28,8 @@ param(
 )
 
 # WinForms требует STA; в Windows PowerShell 5.1 консоль обычно уже STA, но не при запуске из ISE/планировщика.
-if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
+# Перезапуск возможен только если известен путь к файлу скрипта ($PSCommandPath пуст при вставке кода в консоль или F8 в ISE).
+if ($PSCommandPath -and [Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($DataPath) { $relaunch += @('-DataPath', "`"$DataPath`"") }
     if ($SelfTest) { $relaunch += '-SelfTest' }
@@ -40,9 +41,14 @@ if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.Apartme
 #   $SelfTest         - параметр-переключатель: выполнить самопроверку (Invoke-SelfTest) вместо открытия окна.
 #   $DataPath         - параметр скрипта: папка JSON-файлов с данными (если не задана - data рядом со скриптом).
 #   $relaunch         - (в блоке выше) аргументы для повторного запуска powershell.exe в режиме STA.
-#   $script:AppRoot   - папка, где лежит скрипт; от неё строятся путь к папке data\.
+#   $script:AppRoot   - папка, где лежит скрипт; от неё строится путь к папке data\. Если путь к файлу скрипта
+#                       определить нельзя (код вставлен в консоль, запущен выделенный фрагмент в ISE), берётся текущая папка.
 $script:AppRoot = $PSScriptRoot
+if (-not $script:AppRoot -and $MyInvocation.MyCommand.Path) { $script:AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $script:AppRoot) { $script:AppRoot = (Get-Location).ProviderPath }
 if (-not $DataPath) { $DataPath = Join-Path $script:AppRoot 'data' }
+# Относительный путь (например, -DataPath .\d) приводим к полному относительно текущей папки PowerShell.
+$DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DataPath)
 
 # ===========================================================================
 # Хранилище данных (JSON-файлы)
