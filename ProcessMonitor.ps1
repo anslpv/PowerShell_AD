@@ -578,16 +578,31 @@ $script:CollectScript = {
 # $script:ApplyBlockScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере после добавления блокировки:
 #   обновляет групповые политики (gpupdate) и завершает уже запущенные экземпляры заблокированного файла.
 #   $Map  - хэш-таблица "ИМЯ КОМПЬЮТЕРА (в верхнем регистре) -> массив путей к файлу".
-#   Возвращает объект { Computer, GpUpdate ("OK" или код), Killed (сколько процессов завершено), Error }.
+#   Возвращает объект { Computer, GpUpdate ("OK" или код), Found (сколько запущенных экземпляров найдено),
+#   Killed (сколько реально завершено), FailReasons (причины неудач методаTerminate, без повторов), Error }.
+#   Found может быть больше Killed: причина - в FailReasons (чаще всего нет прав на завершение процесса).
+#   Found = 0 при непустом $paths значит, что на момент применения процесс с таким путём уже не запущен
+#   (завершился сам, или путь в данных сканирования устарел).
 #   Локальные: $res - возвращаемый результат; $paths - пути, которые нужно завершить на этом компьютере;
-#   $p - процесс из WMI; $r - результат метода Terminate().
+#   $reasonMap - код возврата Terminate() -> текст причины; $p - процесс из WMI; $r - результат Terminate();
+#   $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
     param($Map)
     $res = New-Object PSObject -Property @{
-        Computer = $env:COMPUTERNAME
-        GpUpdate = ''
-        Killed   = 0
-        Error    = ''
+        Computer    = $env:COMPUTERNAME
+        GpUpdate    = ''
+        Found       = 0
+        Killed      = 0
+        FailReasons = ''
+        Error       = ''
+    }
+    # Коды возврата Win32_Process.Terminate(): https://learn.microsoft.com/windows/win32/cimwin32prov/terminate-method-in-class-win32-process
+    $reasonMap = @{
+        2  = 'нет прав на завершение процесса (Access Denied)'
+        3  = 'недостаточно привилегий (Insufficient Privilege)'
+        8  = 'неизвестная ошибка (Unknown Failure)'
+        9  = 'процесс уже не существует (Not Found)'
+        21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
         & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-Null
@@ -595,12 +610,22 @@ $script:ApplyBlockScript = {
 
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
         if ($paths.Count -gt 0) {
+            $reasons = @{}
             foreach ($p in (Get-WmiObject -Class Win32_Process)) {
                 if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
+                    $res.Found = $res.Found + 1
                     $r = $p.Terminate()
-                    if ($r.ReturnValue -eq 0) { $res.Killed = $res.Killed + 1 }
+                    if ($r.ReturnValue -eq 0) {
+                        $res.Killed = $res.Killed + 1
+                    }
+                    else {
+                        $reason = $reasonMap[[int]$r.ReturnValue]
+                        if (-not $reason) { $reason = 'код ' + $r.ReturnValue }
+                        $reasons[$reason] = $true
+                    }
                 }
             }
+            $res.FailReasons = (@($reasons.Keys | Sort-Object) -join '; ')
         }
     }
     catch {
@@ -1628,6 +1653,7 @@ function Invoke-BlockSelected {
     if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
     else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
     if ($applyNow) { $message += "`n`nНа найденных компьютерах будет выполнен gpupdate, запущенные экземпляры файла будут завершены." }
+    else { $message += "`n`nФлажок `"Сразу применить`" не отмечен: запущенные сейчас процессы НЕ будут завершены, только заблокирован их повторный запуск." }
     if (-not (Confirm-Action -Text $message -Title 'Блокировка по хэшу')) { return }
 
     $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1669,14 +1695,18 @@ function Invoke-BlockSelected {
 }
 
 # Complete-BlockApply - вызывается по завершении применения блокировки: пишет в журнал по каждому
-#   компьютеру результат gpupdate и число завершённых процессов, а также компьютеры с ошибками.
+#   компьютеру результат gpupdate, сколько запущенных экземпляров найдено и сколько реально завершено
+#   (с причиной, если завершить не удалось), а также компьютеры, недоступные по WinRM.
 #   -Job завершённое задание; $result - итог (Receive-JobResults); $r - результат одного компьютера; $f - сбой.
 function Complete-BlockApply {
     param($Job)
     $result = Receive-JobResults -Job $Job
     foreach ($r in $result.Data) {
-        Write-Log ("[{0}] gpupdate: {1}; завершено процессов: {2}{3}" -f $r.Computer, $r.GpUpdate, $r.Killed,
-            $(if ($r.Error) { "; ошибка: $($r.Error)" } else { '' }))
+        $line = "[{0}] gpupdate: {1}; найдено запущенных: {2}; завершено: {3}" -f $r.Computer, $r.GpUpdate, $r.Found, $r.Killed
+        if ($r.Found -gt $r.Killed -and $r.FailReasons) { $line += "; не завершено из-за: $($r.FailReasons)" }
+        if ($r.Found -eq 0) { $line += ' (на момент применения процесс уже не был запущен)' }
+        if ($r.Error) { $line += "; ошибка: $($r.Error)" }
+        Write-Log $line
     }
     foreach ($f in $result.Failures) {
         Write-Log ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
