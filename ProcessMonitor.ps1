@@ -216,7 +216,7 @@ function New-Scan {
 
 # Save-Processes - сохраняет собранные процессы сканирования в его файл и добавляет сканирование в scans.json.
 #   Сначала пишется файл с процессами, потом индекс: сканирование "появляется" только после успешной записи обоих.
-#   Поле User (пользователь компьютера) сохраняется вместе с процессом.
+#   Поле User (владелец процесса - пользователь, запустивший его) сохраняется вместе с процессом.
 #   -ScanId, -ScanDate, -Requested  данные из New-Scan; -Rows  собранные объекты с удалённых компьютеров;
 #   -Succeeded / -Failed  сколько компьютеров ответило / не ответило.
 #   Локальные: $computers - имена компьютеров, приславших данные; $list - записи процессов для файла;
@@ -283,8 +283,8 @@ function Get-Scans {
 # Get-ProcessTable - данные для основной таблицы процессов.
 #   -ScanId     номер сканирования; 0 - показать все сканирования (новые первыми);
 #   -Algorithm  какой хэш показывать в колонке Hash: MD5, SHA1 или SHA256.
-#   Возвращает таблицу: ScanDate, Name, Hash, Computer, User, Path, Size. User - пользователь компьютера на момент
-#   сканирования (в сканированиях, сохранённых до появления этого поля, пусто).
+#   Возвращает таблицу: ScanDate, Name, Hash, Computer, User, Path, Size. User - пользователь, запустивший процесс
+#   (в сканированиях, сохранённых до появления этого поля, пусто).
 #   Локальные: $table - результат; $scan - сканирование из индекса; $doc - прочитанный файл сканирования;
 #   $p - процесс из файла; $user - его пользователь. Если файл сканирования потерян, оно пропускается.
 function Get-ProcessTable {
@@ -475,20 +475,22 @@ function Get-AdComputers {
 }
 
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
-#   Читает Win32_Process, для каждого уникального файла считает MD5/SHA1/SHA256 за один проход чтения
-#   и возвращает объекты { Computer, User, Name, Path, Size, MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
-#   User - кто сейчас работает на компьютере: владельцы процессов explorer.exe (он запущен в каждом интерактивном
-#   сеансе, поэтому видны и консоль, и RDP), в виде "ДОМЕН\логин"; несколько пользователей - через запятую; если
-#   explorer.exe нет (например, Server Core), берётся Win32_ComputerSystem.UserName; если никого нет - пустая строка.
-#   Одно значение User одинаково для всех процессов этого компьютера.
-#   Локальные: $seen - уже обработанные пути (один файл считается один раз); $algs - три объекта хэширования;
-#   $buffer - буфер чтения 1 МБ; $proc - процесс из WMI; $path - путь к exe; $key - путь в нижнем регистре;
-#   $stream - открытый файл (разрешено читать запущенные файлы); $n - сколько байт прочитано;
-#   $a - текущий алгоритм; $size - размер файла. Недоступные файлы пропускаются.
-#   $procs - все процессы из WMI; $users - найденные пользователи (ключи); $ep - процесс при поиске explorer.exe;
-#   $o - результат GetOwner() (Domain, User); $cs - Win32_ComputerSystem; $userText - итоговая строка пользователей.
+#   Читает Win32_Process; для каждого процесса определяет владельца (пользователя, запустившего процесс) методом
+#   GetOwner(), для каждого уникального файла считает MD5/SHA1/SHA256 за один проход чтения и возвращает объекты
+#   { Computer, User, Name, Path, Size, MD5, SHA1, SHA256 }. Работает и в PowerShell 2.0.
+#   User - "ДОМЕН\логин" владельца процесса (системные процессы: "NT AUTHORITY\SYSTEM", "NT AUTHORITY\NETWORK SERVICE" и т. п.);
+#   если владельца определить нельзя (процесс уже завершился, нет доступа) - пустая строка.
+#   Запись одна на пару "файл + владелец": если один и тот же exe запущен разными пользователями, будет несколько строк,
+#   а несколько копий у одного пользователя дают одну строку. Хэш файла считается один раз и берётся из кэша.
+#   Локальные: $procs - все процессы из WMI; $cache - путь (в нижнем регистре) -> результат хэширования (или $null,
+#   если файл недоступен); $seen - уже выданные пары "путь|владелец"; $algs - три объекта хэширования;
+#   $buffer - буфер чтения 1 МБ; $proc - текущий процесс; $path - путь к exe; $key - путь в нижнем регистре;
+#   $o - результат GetOwner() (Domain, User); $owner - "ДОМЕН\логин"; $rowKey - ключ пары "путь|владелец";
+#   $info - результат хэширования файла; $stream - открытый файл (читать запущенные файлы разрешено);
+#   $n - сколько байт прочитано; $a - текущий алгоритм. Недоступные файлы пропускаются.
 $script:CollectScript = {
     $ErrorActionPreference = 'Stop'
+    $cache = @{}
     $seen = @{}
     $algs = @{
         MD5    = [System.Security.Cryptography.MD5]::Create()
@@ -498,52 +500,57 @@ $script:CollectScript = {
     $buffer = New-Object byte[] 1048576
 
     $procs = @(Get-WmiObject -Class Win32_Process)
-    $users = @{}
-    foreach ($ep in $procs) {
-        if ($ep.Name -ieq 'explorer.exe') {
-            try { $o = $ep.GetOwner(); if ($o.User) { $users[($o.Domain + '\' + $o.User)] = $true } } catch { }
-        }
-    }
-    if ($users.Count -eq 0) {
-        try { $cs = Get-WmiObject -Class Win32_ComputerSystem; if ($cs.UserName) { $users[[string]$cs.UserName] = $true } } catch { }
-    }
-    $userText = (@($users.Keys | Sort-Object) -join ', ')
-
     foreach ($proc in $procs) {
         $path = $proc.ExecutablePath
         if (-not $path) { continue }
         $key = $path.ToLower()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
 
-        try {
-            $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        $owner = ''
+        try { $o = $proc.GetOwner(); if ($o.User) { $owner = $o.Domain + '\' + $o.User } } catch { }
+
+        $rowKey = $key + '|' + $owner.ToLower()
+        if ($seen.ContainsKey($rowKey)) { continue }
+        $seen[$rowKey] = $true
+
+        if (-not $cache.ContainsKey($key)) {
+            $info = $null
             try {
-                foreach ($a in $algs.Values) { $a.Initialize() }
-                while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                    foreach ($a in $algs.Values) { [void]$a.TransformBlock($buffer, 0, $n, $null, 0) }
+                $stream = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+                try {
+                    foreach ($a in $algs.Values) { $a.Initialize() }
+                    while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                        foreach ($a in $algs.Values) { [void]$a.TransformBlock($buffer, 0, $n, $null, 0) }
+                    }
+                    foreach ($a in $algs.Values) { [void]$a.TransformFinalBlock($buffer, 0, 0) }
+                    $info = New-Object PSObject -Property @{
+                        Size   = $stream.Length
+                        MD5    = [BitConverter]::ToString($algs.MD5.Hash).Replace('-', '')
+                        SHA1   = [BitConverter]::ToString($algs.SHA1.Hash).Replace('-', '')
+                        SHA256 = [BitConverter]::ToString($algs.SHA256.Hash).Replace('-', '')
+                    }
                 }
-                foreach ($a in $algs.Values) { [void]$a.TransformFinalBlock($buffer, 0, 0) }
-                $size = $stream.Length
+                finally {
+                    $stream.Close()
+                }
             }
-            finally {
-                $stream.Close()
+            catch {
+                $info = $null       # файл недоступен или удалён
             }
+            $cache[$key] = $info
         }
-        catch {
-            continue    # файл недоступен или удалён - пропускаем
-        }
+        $info = $cache[$key]
+        if (-not $info) { continue }
 
         New-Object PSObject -Property @{
             Computer = $env:COMPUTERNAME
-            User     = $userText
+            User     = $owner
             Name     = $proc.Name
             Path     = $path
-            Size     = $size
-            MD5      = [BitConverter]::ToString($algs.MD5.Hash).Replace('-', '')
-            SHA1     = [BitConverter]::ToString($algs.SHA1.Hash).Replace('-', '')
-            SHA256   = [BitConverter]::ToString($algs.SHA256.Hash).Replace('-', '')
+            Size     = $info.Size
+            MD5      = $info.MD5
+            SHA1     = $info.SHA1
+            SHA256   = $info.SHA256
         }
     }
 }
@@ -952,13 +959,15 @@ function Invoke-SelfTest {
         $collected = @(& $script:CollectScript)
         Assert-True ($collected.Count -gt 0) 'не получено ни одного процесса (Win32_Process)'
         $mine = @($collected | Where-Object { $_.Path -ieq $self })
-        Assert-True ($mine.Count -eq 1) "не найден собственный процесс: $self"
+        Assert-True ($mine.Count -ge 1) "не найден собственный процесс: $self"
         Assert-True ($mine[0].PSObject.Properties.Name -contains 'User') 'в результате сбора нет поля User'
         foreach ($alg in 'MD5', 'SHA1', 'SHA256') {
             $ref = (Get-FileHash -LiteralPath $self -Algorithm $alg).Hash
             Assert-True ($mine[0].$alg -eq $ref) "$alg не совпал с Get-FileHash"
         }
-        'процессов с путями: ' + $collected.Count + ', пользователь: ' + $(if ($mine[0].User) { $mine[0].User } else { '(никого не найдено)' })
+        $me = '{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME
+        $owned = @($mine | Where-Object { $_.User -ieq $me })
+        'строк: ' + $collected.Count + ', владелец собственного процесса ' + $(if ($owned.Count -gt 0) { $me + ' определён верно' } else { 'НЕ определился (ожидался ' + $me + ')' })
     }
     Test-Step 'Windows Forms (создание окна и таблицы без показа)' {
         Add-Type -AssemblyName System.Windows.Forms, System.Drawing
