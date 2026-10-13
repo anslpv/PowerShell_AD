@@ -43,6 +43,18 @@ powershell -STA -ExecutionPolicy Bypass -File .\ProcessMonitor.ps1
 
 Данные собираются под учётной записью, от имени которой запущено приложение.
 
+## Самопроверка
+
+Перед первым боевым запуском выполните на своей машине:
+
+```powershell
+powershell -STA -ExecutionPolicy Bypass -File .\ProcessMonitor.ps1 -SelfTest
+```
+
+Окно не открывается; скрипт проверяет версию PowerShell, JSON-хранилище (во временной папке), хэширование процессов
+(с эталоном `Get-FileHash`), Windows Forms, а также наличие модуля GroupPolicy, доступ к AD и работу WinRM на этом компьютере.
+Каждый пункт печатается как `[ OK ]`, `[WARN]` (необязательно: нет RSAT, AD или WinRM) или `[FAIL]`.
+
 ## Как работает блокировка
 
 Правило пишется в `Registry.pol` GPO через `Set-GPRegistryValue`:

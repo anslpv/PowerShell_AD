@@ -13,24 +13,31 @@
     Скрипт самодостаточный (один файл), сторонних драйверов не требует.
     Подробности и требования - в README.md.
 
+.PARAMETER SelfTest
+    Не открывать окно, а проверить на этом компьютере всё, от чего зависит работа (версия PowerShell, JSON-хранилище,
+    хэширование, Windows Forms, WinRM, AD, модуль GroupPolicy), и вывести [ OK ] / [WARN] / [FAIL] по каждому пункту.
+
 .PARAMETER DataPath
     Папка для JSON-файлов с данными. По умолчанию data рядом со скриптом. Прежнее имя -DbPath работает как псевдоним.
 #>
 [CmdletBinding()]
 param(
     [Alias('DbPath')]
-    [string]$DataPath
+    [string]$DataPath,
+    [switch]$SelfTest
 )
 
 # WinForms требует STA; в Windows PowerShell 5.1 консоль обычно уже STA, но не при запуске из ISE/планировщика.
 if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($DataPath) { $relaunch += @('-DataPath', "`"$DataPath`"") }
+    if ($SelfTest) { $relaunch += '-SelfTest' }
     & powershell.exe @relaunch
     exit $LASTEXITCODE
 }
 
 # ПЕРЕМЕННЫЕ ВЕРХНЕГО УРОВНЯ
+#   $SelfTest         - параметр-переключатель: выполнить самопроверку (Invoke-SelfTest) вместо открытия окна.
 #   $DataPath         - параметр скрипта: папка JSON-файлов с данными (если не задана - data рядом со скриптом).
 #   $relaunch         - (в блоке выше) аргументы для повторного запуска powershell.exe в режиме STA.
 #   $script:AppRoot   - папка, где лежит скрипт; от неё строятся путь к папке data\.
@@ -726,6 +733,151 @@ function Remove-SrpHashBlock {
     [void](Remove-GPRegistryValue -Name $GpoName -Key $key -ErrorAction Stop)
 }
 
+
+# ===========================================================================
+# Самопроверка (запуск: .\ProcessMonitor.ps1 -SelfTest)
+# ===========================================================================
+
+# $script:TestFailed - сколько обязательных проверок самопроверки не пройдено.
+$script:TestFailed = 0
+
+# Test-Step - выполняет одну проверку и печатает результат.
+#   -Name название проверки; -Block код проверки (бросает исключение при неудаче, может вернуть строку с подробностями);
+#   -Optional необязательная проверка: неудача печатается как [WARN] и не считается ошибкой (например, нет WinRM или AD).
+#   Локальные: $info - строка подробностей из -Block; $color / $tag - цвет и метка результата.
+function Test-Step {
+    param([string]$Name, [scriptblock]$Block, [switch]$Optional)
+    try {
+        $info = & $Block
+        $line = '[ OK ] ' + $Name
+        if ($info) { $line += ' - ' + $info }
+        Write-Host $line -ForegroundColor Green
+    }
+    catch {
+        $tag = '[FAIL]'
+        $color = 'Red'
+        if ($Optional) { $tag = '[WARN]'; $color = 'Yellow' }
+        else { $script:TestFailed++ }
+        Write-Host ('{0} {1} - {2}' -f $tag, $Name, $_.Exception.Message) -ForegroundColor $color
+    }
+}
+
+# Assert-True - бросает исключение с сообщением, если условие ложно. -Condition проверяемое условие; -Message текст ошибки.
+function Assert-True {
+    param($Condition, [string]$Message)
+    if (-not $Condition) { throw $Message }
+}
+
+# Invoke-SelfTest - проверяет на ЭТОМ компьютере то, от чего зависит приложение; ничего не меняет в реальных данных
+#   (хранилище проверяется во временной папке, которая потом удаляется). Возвращает число непройденных
+#   обязательных проверок (0 - всё хорошо). Локальные: $tmp - временная папка; $rows - тестовые строки процессов;
+#   $scan - тестовое сканирование; $self - путь к powershell.exe текущего процесса; $collected - результат
+#   локального запуска $script:CollectScript; $ref - эталонный хэш из Get-FileHash; $job / $res - тест WinRM.
+function Invoke-SelfTest {
+    $script:TestFailed = 0
+    Write-Host 'Самопроверка Process Monitor' -ForegroundColor Cyan
+
+    Test-Step 'Версия PowerShell' {
+        $v = $PSVersionTable.PSVersion
+        Assert-True ($v.Major -gt 5 -or ($v.Major -eq 5 -and $v.Minor -ge 1)) "нужна версия 5.1 или новее, сейчас $v"
+        '{0}, {1}, CLR {2}' -f $v, $PSVersionTable.PSEdition, $PSVersionTable.CLRVersion
+    }
+    Test-Step 'Режим потока STA (нужен для окна)' {
+        Assert-True ([Threading.Thread]::CurrentThread.GetApartmentState() -eq [Threading.ApartmentState]::STA) 'поток не STA - запускайте через powershell.exe -STA'
+    }
+    Test-Step 'Сериализатор JSON' {
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            Assert-True $script:JsonSerializer 'JavaScriptSerializer недоступен (System.Web.Extensions)'
+            'JavaScriptSerializer'
+        }
+        else { 'запасной вариант ConvertTo-Json (не Windows PowerShell)' }
+    }
+    Test-Step 'Проверка хэша и защита системных путей' {
+        Assert-True (Test-HashValue -Algorithm MD5 -Hash ('A' * 32)) 'MD5 из 32 символов должен считаться корректным'
+        Assert-True (-not (Test-HashValue -Algorithm MD5 -Hash ('G' * 32))) 'не-hex хэш должен отклоняться'
+        Assert-True (Test-ProtectedPath -Path 'C:\Windows\System32\svchost.exe') 'каталог Windows должен быть защищён'
+        Assert-True (-not (Test-ProtectedPath -Path 'C:\Program Files\App\a.exe')) 'Program Files не должен быть защищён'
+        Assert-True ((ConvertFrom-HexString -Hex 'DEADBEEF').Length -eq 4) 'ConvertFrom-HexString вернул не 4 байта'
+    }
+    Test-Step 'JSON-хранилище (сканирования, процессы, блокировки, кириллица, перезагрузка с диска)' {
+        $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pm-selftest-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            Initialize-Database -Path $tmp
+            $rows = @(
+                [pscustomobject]@{ Computer = 'pc1'; Name = 'тест.exe'; Path = 'C:\Прог\тест.exe'; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
+                [pscustomobject]@{ Computer = 'PC2'; Name = 'b.exe'; Path = 'C:\b.exe'; Size = 10; MD5 = 'aa'; SHA1 = 'dd'; SHA256 = 'ee' }
+            )
+            $scan = New-Scan -Requested 3
+            Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested 3 -Rows $rows -Succeeded 2 -Failed 1
+            Add-BlockRecord -Name 'тест.exe' -Algorithm MD5 -Hash 'aa' -Size 5GB -GpoName 'G' -RuleId '{1}'
+
+            $script:Scans = $null; $script:Blocks = $null
+            Initialize-Database -Path $tmp                       # заново читаем всё с диска
+            $table = Get-ProcessTable -ScanId $scan.Id -Algorithm MD5
+            Assert-True ($table.Rows.Count -eq 2) "ожидалось 2 строки, получено $($table.Rows.Count)"
+            Assert-True ($table.Rows[0].Name -eq 'b.exe' -or $table.Rows[1].Name -eq 'b.exe') 'не найден b.exe'
+            $ru = @($table.Rows | Where-Object { $_.Name -eq 'тест.exe' })
+            Assert-True ($ru.Count -eq 1) 'кириллица в имени потеряна'
+            Assert-True ($ru[0].Size -eq 5GB) 'размер больше 4 ГБ искажён'
+            Assert-True ($ru[0].Computer -eq 'PC1' -and $ru[0].Hash -eq 'AA') 'имя/хэш должны быть в верхнем регистре'
+            Assert-True ((Get-HashLocations -Algorithm MD5 -Hash 'aa').Rows.Count -eq 2) 'Get-HashLocations: ожидалось 2 места'
+            Assert-True (Get-ActiveBlock -Algorithm MD5 -Hash 'AA') 'активная блокировка не найдена после перезагрузки'
+            Disable-BlockRecord -Id 1
+            Assert-True (-not (Get-ActiveBlock -Algorithm MD5 -Hash 'AA')) 'блокировка не снялась'
+            Assert-True ((Get-BlockTable).Rows[0].Status -eq 'Снята') 'статус блокировки неверный'
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $tmp 'scans.json'))
+            Assert-True (-not ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB)) 'файл JSON записан с BOM'
+            'записей: 2, файлов: ' + @(Get-ChildItem $tmp -Recurse -File).Count
+        }
+        finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-Step 'Хэширование процессов (локальный запуск скрипта сбора, сверка с Get-FileHash)' {
+        $self = (Get-Process -Id $PID).Path
+        $collected = @(& $script:CollectScript)
+        Assert-True ($collected.Count -gt 0) 'не получено ни одного процесса (Win32_Process)'
+        $mine = @($collected | Where-Object { $_.Path -ieq $self })
+        Assert-True ($mine.Count -eq 1) "не найден собственный процесс: $self"
+        foreach ($alg in 'MD5', 'SHA1', 'SHA256') {
+            $ref = (Get-FileHash -LiteralPath $self -Algorithm $alg).Hash
+            Assert-True ($mine[0].$alg -eq $ref) "$alg не совпал с Get-FileHash"
+        }
+        'процессов с путями: ' + $collected.Count
+    }
+    Test-Step 'Windows Forms (создание окна и таблицы без показа)' {
+        Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+        $form = New-Object System.Windows.Forms.Form
+        $grid = New-Object System.Windows.Forms.DataGridView
+        $form.Controls.Add($grid)
+        $form.Dispose()
+    }
+    Test-Step 'Модуль GroupPolicy (RSAT) - нужен для блокировки' -Optional {
+        Assert-True (Test-GroupPolicyModule) 'модуль не найден; установите Group Policy Management (RSAT)'
+    }
+    Test-Step 'Запрос списка компьютеров из AD' -Optional {
+        $found = @(Get-AdComputers | Select-Object -First 5)
+        Assert-True ($found.Count -gt 0) 'компьютеры не найдены'
+        'например: ' + (($found | ForEach-Object { $_.Host }) -join ', ')
+    }
+    Test-Step 'WinRM: сбор процессов с этого компьютера через Invoke-Command -AsJob' -Optional {
+        $job = Start-Collection -ComputerName $env:COMPUTERNAME
+        $null = Wait-Job -Job $job -Timeout 180
+        Assert-True ($job.State -ne 'Running') 'за 180 с задание не завершилось'
+        $res = Receive-JobResults -Job $job
+        Assert-True ($res.Succeeded -eq 1) ('WinRM не ответил: ' + (($res.Failures | ForEach-Object { $_.Message }) -join '; '))
+        'получено записей: ' + $res.Data.Count
+    }
+
+    if ($script:TestFailed -eq 0) { Write-Host 'Итог: обязательные проверки пройдены.' -ForegroundColor Green }
+    else { Write-Host ('Итог: не пройдено обязательных проверок: {0}.' -f $script:TestFailed) -ForegroundColor Red }
+    return $script:TestFailed
+}
+
+if ($SelfTest) {
+    $code = Invoke-SelfTest
+    exit ([int]$code)
+}
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
