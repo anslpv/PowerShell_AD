@@ -577,28 +577,35 @@ $script:CollectScript = {
 
 # $script:ApplyBlockScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере сразу после добавления блокировки:
 #   принудительно обновляет групповые политики (gpupdate /target:computer /force), чтобы правило SRP подействовало
-#   немедленно, а не ждало планового обновления (по умолчанию - до 90 минут). Это выполняется ВСЕГДА, автоматически,
-#   без отдельного флажка. Завершение уже запущенных экземпляров файла - отдельное, более заметное для пользователя
-#   действие (может прервать несохранённую работу), поэтому управляется флажком -TerminateProcesses отдельно.
+#   немедленно, а не ждало планового обновления (по умолчанию - до 90 минут), затем ЗАВЕРШАЕТ уже запущенные
+#   экземпляры заблокированного файла и показывает каждому затронутому пользователю на экране (msg.exe) короткое
+#   уведомление, что запускать это нельзя. Всё это происходит автоматически при блокировке, без отдельных флажков.
 #   $Map  - хэш-таблица "ИМЯ КОМПЬЮТЕРА (в верхнем регистре) -> массив путей к файлу".
-#   $TerminateProcesses - завершать ли найденные запущенные экземпляры ($true/$false).
+#   $TerminateProcesses - завершать ли найденные запущенные экземпляры ($true/$false; UI всегда передаёт $true,
+#   параметр оставлен для тестов и на случай, если понадобится более осторожный режим "только gpupdate").
+#   $NotifyText - текст уведомления (без имени файла - оно подставляется автоматически).
 #   Возвращает объект { Computer, GpUpdate ("OK" или код), TerminateRequested, Found (сколько запущенных экземпляров
 #   найдено - считается независимо от TerminateRequested), Killed (сколько реально завершено),
-#   FailReasons (причины неудач метода Terminate, без повторов), Error }.
+#   Notified (скольким пользователям показано уведомление - один раз на пользователя, даже если у него несколько
+#   запущенных экземпляров), FailReasons (причины неудач метода Terminate, без повторов), Error }.
 #   Found может быть больше Killed: причина - в FailReasons (чаще всего нет прав на завершение процесса).
 #   Found = 0 при непустом $paths значит, что на момент применения процесс с таким путём уже не запущен
-#   (завершился сам, или путь в данных сканирования устарел).
+#   (завершился сам, или путь в данных сканирования устарел). Уведомление отправляется, только если процесс
+#   реально завершён (TRUE Kill), и только один раз на пользователя, даже если он держал открытыми несколько копий.
 #   Локальные: $res - возвращаемый результат; $paths - пути, по которым ищем запущенные экземпляры;
-#   $reasonMap - код возврата Terminate() -> текст причины; $p - процесс из WMI; $r - результат Terminate();
-#   $reason - текст причины для конкретного кода.
+#   $reasonMap - код возврата Terminate() -> текст причины; $notified - кому уведомление уже отправлено в этом
+#   запуске (защита от дублей); $p - процесс из WMI; $owner - владелец именно этого запущенного экземпляра
+#   (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки им может быть уже другой
+#   пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
-    param($Map, $TerminateProcesses)
+    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.')
     $res = New-Object PSObject -Property @{
         Computer           = $env:COMPUTERNAME
         GpUpdate           = ''
         TerminateRequested = [bool]$TerminateProcesses
         Found              = 0
         Killed             = 0
+        Notified           = 0
         FailReasons        = ''
         Error              = ''
     }
@@ -617,13 +624,25 @@ $script:ApplyBlockScript = {
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
         if ($paths.Count -gt 0) {
             $reasons = @{}
+            $notified = @{}
             foreach ($p in (Get-WmiObject -Class Win32_Process)) {
                 if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
                     $res.Found = $res.Found + 1
                     if ($TerminateProcesses) {
+                        $owner = ''
+                        try { $o = $p.GetOwner(); if ($o.User) { $owner = $o.User } } catch { }
+
                         $r = $p.Terminate()
                         if ($r.ReturnValue -eq 0) {
                             $res.Killed = $res.Killed + 1
+                            if ($owner -and -not $notified.ContainsKey($owner)) {
+                                $notified[$owner] = $true
+                                try {
+                                    & "$env:windir\System32\msg.exe" $owner /TIME:30 $NotifyText 2>&1 | Out-Null
+                                    if ($LASTEXITCODE -eq 0) { $res.Notified = $res.Notified + 1 }
+                                }
+                                catch { }
+                            }
                         }
                         else {
                             $reason = $reasonMap[[int]$r.ReturnValue]
@@ -661,14 +680,15 @@ function Start-Collection {
         -AsJob -JobName 'ProcMon-Collect'
 }
 
-# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик + по желанию завершение
-#   процессов) на компьютерах, где найден заблокированный файл.
+# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик, завершение процессов и
+#   уведомление пользователей) на компьютерах, где найден заблокированный файл.
 #   -Map  "ИМЯ КОМПЬЮТЕРА -> пути к файлу" (ключи Map - список компьютеров);
-#   -TerminateProcesses  завершать ли найденные запущенные экземпляры. Возвращает задание.
+#   -TerminateProcesses  завершать ли найденные запущенные экземпляры;
+#   -NotifyText  текст уведомления пользователю при завершении его процесса. Возвращает задание.
 function Start-BlockApply {
-    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false)
+    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText)
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
-        -ArgumentList $Map, $TerminateProcesses -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -ArgumentList $Map, $TerminateProcesses, $NotifyText -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
 }
 
@@ -1319,18 +1339,18 @@ $tabProcesses.Controls.Add($procBar)
 # --- Вкладка "Блокировки" --------------------------------------------------
 # Вкладка "Блокировки":
 #   $blockBar - панель инструментов; $script:GpoBox - имя GPO, в которую добавляются правила;
-#   $script:LinkBox - DN контейнера, к которому привязать GPO (необязательно);
-#   обновление политик (gpupdate) на известных компьютерах происходит автоматически при каждой блокировке, без
-#   флажка; $script:KillRunningBox - отдельный флажок "Также завершить уже запущенные процессы" (может прервать
-#   несохранённую работу пользователя, поэтому остаётся опциональным);
+#   $script:LinkBox - DN контейнера, к которому привязать GPO (необязательно).
+#   На известных компьютерах (где файл встречался в последнем сканировании) блокировка автоматически: обновляет
+#   политики (gpupdate), завершает уже запущенные экземпляры файла и показывает каждому затронутому пользователю
+#   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков.
 #   $btnUnblock - "Снять блокировку"; $script:BlockGrid - таблица всех блокировок.
+$script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
 $blockBar = New-Toolbar
 $script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
 $script:LinkBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 300; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
-$script:KillRunningBox = New-Object System.Windows.Forms.CheckBox -Property @{ Text = 'Также завершить уже запущенные процессы'; AutoSize = $true; Margin = (New-Object System.Windows.Forms.Padding(10, 8, 2, 0)) }
 $btnUnblock = New-Button 'Снять блокировку' 140
 $blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, необязательно):'), $script:LinkBox,
-        $script:KillRunningBox, $btnUnblock))
+        $btnUnblock))
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
@@ -1616,13 +1636,13 @@ function Update-BlockGrid {
 # Invoke-BlockSelected - обработчик "Заблокировать по хэшу...". Порядок действий:
 #   1) проверки (выбрана строка, указана GPO, хэш корректен, файл не в Windows\, есть модуль GroupPolicy,
 #      блокировка ещё не действует); 2) окно подтверждения; 3) правило добавляется в GPO и в журнал;
-#   4) на всех компьютерах, где файл встречался в последнем сканировании, АВТОМАТИЧЕСКИ запускается
-#      принудительное обновление политик (gpupdate), без отдельного флажка - правило SRP действует немедленно,
-#      а не только после планового обновления (до 90 минут); 5) если отмечен флажок "Также завершить уже
-#      запущенные процессы" - там же завершаются и текущие запущенные экземпляры файла.
+#   4) на всех компьютерах, где файл встречался в последнем сканировании, АВТОМАТИЧЕСКИ, без отдельных флажков:
+#      обновляются политики (gpupdate - правило SRP действует немедленно, а не после планового обновления,
+#      по умолчанию до 90 минут), завершаются уже запущенные экземпляры файла, а их пользователям показывается
+#      уведомление ($script:NotifyTemplate).
 #   Локальные: $row - выбранная строка таблицы; $algorithm / $hash / $name / $path / $size - данные файла;
 #   $gpo - имя GPO; $linkTarget - DN для привязки; $locations - где хэш найден; $computerCount - на скольких
-#   компьютерах; $killRunning - флажок "Также завершить уже запущенные процессы"; $message - текст
+#   компьютерах; $notifyText - готовый текст уведомления (имя файла подставлено); $message - текст
 #   подтверждения; $ruleId - GUID созданного правила; $map - "компьютер -> пути" для применения; $loc, $key -
 #   элемент и ключ при его построении; $job - фоновое задание применения.
 function Invoke-BlockSelected {
@@ -1663,13 +1683,14 @@ function Invoke-BlockSelected {
 
     $locations = Get-HashLocations -Algorithm $algorithm -Hash $hash
     $computerCount = @($locations.Rows | ForEach-Object { $_.Computer } | Select-Object -Unique).Count
-    $killRunning = $script:KillRunningBox.Checked
+    $notifyText = $script:NotifyTemplate -f $name
     $message = "Заблокировать запуск файла по хэшу?`n`nИмя: $name`n${algorithm}: $hash`nРазмер: $size байт`nПример пути: $path`nНайден на компьютерах (последнее сканирование): $computerCount`n`nGPO: $gpo"
     if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
     else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
-    if ($computerCount -gt 0) { $message += "`n`nПолитики на этих компьютерах будут обновлены (gpupdate) сразу после добавления правила." }
-    if ($killRunning) { $message += "`n`nБудут также завершены уже запущенные экземпляры файла (может прервать несохранённую работу пользователя)." }
-    else { $message += "`n`nЗапущенные сейчас экземпляры НЕ будут завершены, только заблокирован их повторный запуск." }
+    if ($computerCount -gt 0) {
+        $message += "`n`nНа этих компьютерах сразу после добавления правила: обновятся политики (gpupdate), будут" +
+            " закрыты уже запущенные экземпляры файла, а их пользователям будет показано сообщение:`n`"$notifyText`""
+    }
     if (-not (Confirm-Action -Text $message -Title 'Блокировка по хэшу')) { return }
 
     $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1695,11 +1716,10 @@ function Invoke-BlockSelected {
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             $map[$key] += [string]$loc.Path
         }
-        $action = if ($killRunning) { 'gpupdate + завершение процессов' } else { 'gpupdate' }
-        Write-Log "Применение на $($map.Count) компьютерах ($action)..."
+        Write-Log "Применение на $($map.Count) компьютерах (gpupdate + завершение процессов + уведомление)..."
         Set-Status "Применение блокировки на $($map.Count) компьютерах..."
         try {
-            $job = Start-BlockApply -Map $map -TerminateProcesses $killRunning
+            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText
             Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
         }
         catch {
@@ -1722,7 +1742,7 @@ function Complete-BlockApply {
     foreach ($r in $result.Data) {
         $line = "[{0}] gpupdate: {1}" -f $r.Computer, $r.GpUpdate
         if ($r.TerminateRequested) {
-            $line += "; найдено запущенных: {0}; завершено: {1}" -f $r.Found, $r.Killed
+            $line += "; найдено запущенных: {0}; завершено: {1}; уведомлено пользователей: {2}" -f $r.Found, $r.Killed, $r.Notified
             if ($r.Found -gt $r.Killed -and $r.FailReasons) { $line += "; не завершено из-за: $($r.FailReasons)" }
             if ($r.Found -eq 0) { $line += ' (на момент применения процесс уже не был запущен)' }
         }
