@@ -69,8 +69,9 @@ $DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSP
 #                    Succeeded, Failed, Computers). Процессы в память целиком не загружаются - читаются по запросу.
 # $script:Blocks   - журнал блокировок из blocks.json в памяти (ArrayList словарей: Id, BlockDate, Name, Algorithm,
 #                    Hash, Size, GpoName, RuleId, Active).
-# $script:JsonSerializer - быстрый сериализатор JSON из .NET Framework (JavaScriptSerializer). Если он недоступен
-#                    (например, при проверке на PowerShell 7), используются ConvertTo-Json / ConvertFrom-Json.
+# $script:JsonSerializer - JavaScriptSerializer из .NET Framework, используется ТОЛЬКО для чтения JSON (быстро и даёт чистые
+#                    .NET-словари). Для записи применяется собственный Write-JsonValue. Если JavaScriptSerializer
+#                    недоступен (например, при проверке на PowerShell 7), чтение идёт через ConvertFrom-Json.
 $script:StoreDir = $null
 $script:Scans = $null
 $script:Blocks = $null
@@ -84,19 +85,98 @@ catch {
     $script:JsonSerializer = $null
 }
 
-# ConvertTo-JsonText - превращает данные (словари, списки, строки, числа) в текст JSON. -Data что сериализовать.
+# Write-JsonValue - дописывает в StringBuilder значение в формате JSON. Рекурсивно обходит словари (IDictionary ->
+#   объект {...}), списки и массивы (IEnumerable -> [...]); строки экранируются, числа пишутся в инвариантной культуре.
+#   Это собственный сериализатор, а не JavaScriptSerializer: в Windows PowerShell 5.1 тот пытается сериализовать
+#   PowerShell-обёртку (PSObject / PSParameterizedProperty) и падает с "обнаружена циклическая ссылка".
+#   -Value что записать (словарь, список, строка, число, bool, $null); -Sb куда дописывать.
+#   Для скорости строки и числа внутри словаря пишутся прямо в цикле, без отдельного вызова функции.
+#   Локальные: $e - запись словаря; $v - её значение; $item - элемент списка; $first - "первый элемент" (для запятых).
+function Write-JsonValue {
+    param($Value, [System.Text.StringBuilder]$Sb)
+    if ($null -eq $Value) { [void]$Sb.Append('null'); return }
+    $Value = $Value.psobject.BaseObject      # снять PowerShell-обёртку (.BaseObject напрямую на списках перечислялся бы по элементам)
+
+    if ($Value -is [string]) {
+        $t = $Value.Replace('\', '\\').Replace('"', '\"').Replace("`r", '\r').Replace("`n", '\n').Replace("`t", '\t')
+        if ($t -match '[\x00-\x1f]') { $t = [regex]::Replace($t, '[\x00-\x1f]', { param($m) '\u{0:x4}' -f [int][char]$m.Value }) }
+        [void]$Sb.Append('"').Append($t).Append('"')
+        return
+    }
+    if ($Value -is [bool]) { [void]$Sb.Append($(if ($Value) { 'true' } else { 'false' })); return }
+    if ($Value -is [System.Collections.IDictionary]) {
+        [void]$Sb.Append('{')
+        $first = $true
+        foreach ($e in $Value.GetEnumerator()) {
+            if (-not $first) { [void]$Sb.Append(',') }
+            $first = $false
+            [void]$Sb.Append('"').Append(([string]$e.Key).Replace('\', '\\').Replace('"', '\"')).Append('":')     # имена полей - обычные идентификаторы
+            $v = $e.Value
+            if ($v -is [string]) {
+                $t = $v.Replace('\', '\\').Replace('"', '\"')
+                if ($t -match '[\x00-\x1f]') { Write-JsonValue -Value $v -Sb $Sb }
+                else { [void]$Sb.Append('"').Append($t).Append('"') }
+            }
+            elseif ($v -is [long] -or $v -is [int]) { [void]$Sb.Append($v.ToString([System.Globalization.CultureInfo]::InvariantCulture)) }
+            else { Write-JsonValue -Value $v -Sb $Sb }
+        }
+        [void]$Sb.Append('}')
+        return
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        [void]$Sb.Append('[')
+        $first = $true
+        foreach ($item in $Value) {
+            if (-not $first) { [void]$Sb.Append(',') }
+            $first = $false
+            Write-JsonValue -Value $item -Sb $Sb
+        }
+        [void]$Sb.Append(']')
+        return
+    }
+    if ($Value -is [ValueType] -and $Value -isnot [char] -and $Value -isnot [datetime] -and $Value -isnot [enum]) {
+        [void]$Sb.Append([Convert]::ToString($Value, [System.Globalization.CultureInfo]::InvariantCulture))
+        return
+    }
+    Write-JsonValue -Value ([string]$Value) -Sb $Sb      # всё прочее (даты, символы, перечисления) - как строка
+}
+
+# ConvertTo-JsonText - превращает данные (словари, списки, строки, числа) в текст JSON через Write-JsonValue.
+#   -Data что сериализовать. $sb - накапливаемый текст.
 function ConvertTo-JsonText {
     param([Parameter(Mandatory)]$Data)
-    if ($script:JsonSerializer) { return $script:JsonSerializer.Serialize($Data) }
-    return (ConvertTo-Json -InputObject $Data -Depth 10 -Compress)
+    $sb = New-Object System.Text.StringBuilder
+    Write-JsonValue -Value $Data -Sb $sb
+    return $sb.ToString()
+}
+
+# ConvertTo-PlainData - превращает результат ConvertFrom-Json (PSCustomObject и массивы) в хэш-таблицы и ArrayList,
+#   чтобы работал доступ $d['Ключ']. Нужна только в запасном варианте чтения на PowerShell 5.1 без JavaScriptSerializer.
+#   -Value результат ConvertFrom-Json. $d - собираемая хэш-таблица; $prop - свойство объекта; $list / $i - список и его элемент.
+function ConvertTo-PlainData {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $d = @{}
+        foreach ($prop in $Value.PSObject.Properties) { $d[$prop.Name] = ConvertTo-PlainData -Value $prop.Value }
+        return $d
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $list = New-Object System.Collections.ArrayList
+        foreach ($i in $Value) { [void]$list.Add((ConvertTo-PlainData -Value $i)) }
+        return , $list
+    }
+    return $Value
 }
 
 # ConvertFrom-JsonText - превращает текст JSON в словари и массивы (объект JSON -> словарь, доступ $d['Ключ']).
-#   -Text строка с JSON.
+#   Читает JavaScriptSerializer.DeserializeObject (быстро, возвращает чистые .NET-типы). Если его нет - ConvertFrom-Json
+#   (на PowerShell 6+ с -AsHashtable, на 5.1 с преобразованием через ConvertTo-PlainData). -Text строка с JSON.
 function ConvertFrom-JsonText {
     param([Parameter(Mandatory)][string]$Text)
     if ($script:JsonSerializer) { return $script:JsonSerializer.DeserializeObject($Text) }
-    return (ConvertFrom-Json -InputObject $Text -AsHashtable)
+    if ($PSVersionTable.PSVersion.Major -ge 6) { return (ConvertFrom-Json -InputObject $Text -AsHashtable) }
+    return (ConvertTo-PlainData -Value (ConvertFrom-Json -InputObject $Text))
 }
 
 # Read-JsonFile - читает JSON-файл. Возвращает $null, если файла нет или он пустой; если файл повреждён - ошибка.
@@ -819,7 +899,7 @@ function Invoke-SelfTest {
         try {
             Initialize-Database -Path $tmp
             $rows = @(
-                [pscustomobject]@{ Computer = 'pc1'; Name = 'тест.exe'; Path = 'C:\Прог\тест.exe'; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
+                [pscustomobject]@{ Computer = 'pc1'; Name = 'тест.exe'; Path = "C:\Прог\`"тест`"`t.exe"; Size = 5GB; MD5 = 'aa'; SHA1 = 'bb'; SHA256 = 'cc' },
                 [pscustomobject]@{ Computer = 'PC2'; Name = 'b.exe'; Path = 'C:\b.exe'; Size = 10; MD5 = 'aa'; SHA1 = 'dd'; SHA256 = 'ee' }
             )
             $scan = New-Scan -Requested 3
@@ -834,6 +914,7 @@ function Invoke-SelfTest {
             $ru = @($table.Rows | Where-Object { $_.Name -eq 'тест.exe' })
             Assert-True ($ru.Count -eq 1) 'кириллица в имени потеряна'
             Assert-True ($ru[0].Size -eq 5GB) 'размер больше 4 ГБ искажён'
+            Assert-True ($ru[0].Path -ceq ('C:\Прог\"тест"' + "`t.exe")) 'кавычки, обратная косая и табуляция в пути искажены'
             Assert-True ($ru[0].Computer -eq 'PC1' -and $ru[0].Hash -eq 'AA') 'имя/хэш должны быть в верхнем регистре'
             Assert-True ((Get-HashLocations -Algorithm MD5 -Hash 'aa').Rows.Count -eq 2) 'Get-HashLocations: ожидалось 2 места'
             Assert-True (Get-ActiveBlock -Algorithm MD5 -Hash 'AA') 'активная блокировка не найдена после перезагрузки'
