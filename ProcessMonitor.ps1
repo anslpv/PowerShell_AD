@@ -1264,18 +1264,23 @@ $script:Timer = New-Object System.Windows.Forms.Timer
 $script:Timer.Interval = 700
 $script:Timer.Add_Tick({
         foreach ($item in @($script:PendingJobs)) {
-            try {
-                if ($item.Job.State -in 'Running', 'NotStarted') {
-                    if ($item.OnProgress) { & $item.OnProgress $item.Job }
+            if ($item.Job.State -in 'Running', 'NotStarted') {
+                # Сбой в обновлении прогресса не должен прерывать сам сбор: пишем в журнал один раз и продолжаем ждать.
+                if ($item.OnProgress) {
+                    try { & $item.OnProgress $item.Job }
+                    catch {
+                        if (-not $item.ProgressFailed) {
+                            $item.ProgressFailed = $true
+                            Write-Log ("Ошибка обновления прогресса: {0}`n{1}`n{2}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage, $_.ScriptStackTrace)
+                        }
+                    }
                 }
-                else {
-                    [void]$script:PendingJobs.Remove($item)
-                    & $item.OnDone $item.Job
-                }
+                continue
             }
+            [void]$script:PendingJobs.Remove($item)
+            try { & $item.OnDone $item.Job }
             catch {
-                Write-Log "Ошибка обработки задания: $($_.Exception.Message)"
-                [void]$script:PendingJobs.Remove($item)
+                Write-Log ("Ошибка обработки задания: {0}`n{1}`n{2}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage, $_.ScriptStackTrace)
             }
         }
     })
