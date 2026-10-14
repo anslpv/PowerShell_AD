@@ -402,7 +402,9 @@ function Add-BlockRecord {
         [Parameter(Mandatory)][string]$Hash,
         [long]$Size,
         [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$RuleId
+        [Parameter(Mandatory)][string]$RuleId,
+        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
+        [string]$Target = 'Все пользователи компьютера'
     )
     $id = 1
     foreach ($b in $script:Blocks) {
@@ -418,6 +420,8 @@ function Add-BlockRecord {
             GpoName   = $GpoName
             RuleId    = $RuleId
             Active    = 1
+            Scope     = $Scope
+            Target    = $Target
         })
     try {
         Save-BlockLog
@@ -432,6 +436,9 @@ function Add-BlockRecord {
 #   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime - результат последней проверки
 #   срабатываний (см. Update-BlockEventInfo); у блокировок, которые ещё не проверяли, EventCount = -1
 #   ("не проверялось" - отличие от 0, то есть "проверили, попыток не было"), LastEventTime пусто.
+#   Scope/Target - новые поля ("для кого" заблокировано: вся машина или конкретный пользователь/группа, см.
+#   Add-BlockRecord); у записей, сделанных до появления этой возможности, их нет в файле на диске, поэтому
+#   читаются с запасным значением ('Computer'/'Все пользователи компьютера') - как раз для таких старых записей.
 function Get-BlockTable {
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('Id', [int])
@@ -446,6 +453,8 @@ function Get-BlockTable {
     [void]$table.Columns.Add('EventCount', [int])
     [void]$table.Columns.Add('Occurrences', [string])
     [void]$table.Columns.Add('LastEventTime', [string])
+    [void]$table.Columns.Add('Scope', [string])
+    [void]$table.Columns.Add('Target', [string])
     for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
         $b = $script:Blocks[$i]
         $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
@@ -456,10 +465,14 @@ function Get-BlockTable {
         if ($b.Contains('EventCount')) { $eventCount = [int]$b['EventCount'] }
         $lastEventTime = ''
         if ($b.Contains('LastEventTime')) { $lastEventTime = [string]$b['LastEventTime'] }
+        $scope = 'Computer'
+        if ($b.Contains('Scope') -and $b['Scope']) { $scope = [string]$b['Scope'] }
+        $target = 'Все пользователи компьютера'
+        if ($b.Contains('Target') -and $b['Target']) { $target = [string]$b['Target'] }
         $occurrences = if ($eventCount -lt 0) { 'не проверялось' } else { [string]$eventCount }
         [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
             [string]$b['Hash'], [string]$b['GpoName'], [string]$b['RuleId'], [int]$b['Active'], $status,
-            $eventCount, $occurrences, $lastEventTime)
+            $eventCount, $occurrences, $lastEventTime, $scope, $target)
     }
     return , $table
 }
@@ -592,6 +605,70 @@ function Get-AdOrganizationalUnits {
     }
 }
 
+# Get-AdUsersAndGroups - пользователи и группы AD для выпадающего списка "Пользователь/группа" на вкладке
+#   "Блокировки" (блокировка не для всех, а для конкретной учётной записи или группы - см. Invoke-BlockSelected).
+#   Как и Get-AdOrganizationalUnits, грузит весь список сразу и может быть не быстрой в большом домене.
+#   Возвращает { Sam = sAMAccountName (именно он нужен Set-GPPermission); Display = отображаемое имя;
+#   Type = 'User' или 'Group' }, отсортированные по Display. Записи без sAMAccountName пропускаются.
+#   Локальные: $root/$domainDn/$searcher/$results/$r - как в Get-AdOrganizationalUnits; $sam/$display/$cat/$type -
+#   поля текущей записи ($cat - DN класса объекта, по нему отличаем группу от пользователя).
+function Get-AdUsersAndGroups {
+    $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
+    $domainDn = [string]$root.Properties['defaultNamingContext'][0]
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
+    $searcher.Filter = '(|(&(objectCategory=person)(objectClass=user))(objectCategory=group))'
+    $searcher.PageSize = 1000
+    foreach ($prop in 'samaccountname', 'displayname', 'name', 'objectcategory') {
+        [void]$searcher.PropertiesToLoad.Add($prop)
+    }
+
+    $results = $searcher.FindAll()
+    try {
+        foreach ($r in ($results | Sort-Object {
+                    if ($_.Properties['displayname'].Count) { [string]$_.Properties['displayname'][0] } else { [string]$_.Properties['name'][0] }
+                })) {
+            $sam = if ($r.Properties['samaccountname'].Count) { [string]$r.Properties['samaccountname'][0] } else { '' }
+            if (-not $sam) { continue }
+            $display = if ($r.Properties['displayname'].Count) { [string]$r.Properties['displayname'][0] } else { [string]$r.Properties['name'][0] }
+            $cat = [string]$r.Properties['objectcategory'][0]
+            $type = if ($cat -match '(?i)^CN=Group,') { 'Group' } else { 'User' }
+            [pscustomobject]@{ Sam = $sam; Display = $display; Type = $type }
+        }
+    }
+    finally {
+        $results.Dispose()
+        $searcher.Dispose()
+    }
+}
+
+# Resolve-AdPrincipalType - определяет, пользователь это или группа, по sAMAccountName, если тип не пришёл
+#   вместе с выбором из списка (например, имя набрано вручную). -Sam  sAMAccountName. Возвращает 'User',
+#   'Group' или $null (учётная запись не найдена или AD недоступен - вызывающий код должен в этом случае
+#   остановиться и попросить выбрать запись из списка, а не угадывать тип).
+function Resolve-AdPrincipalType {
+    param([Parameter(Mandatory)][string]$Sam)
+    $searcher = $null
+    try {
+        $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
+        $domainDn = [string]$root.Properties['defaultNamingContext'][0]
+        $searcher = New-Object System.DirectoryServices.DirectorySearcher
+        $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
+        $searcher.Filter = "(sAMAccountName=$Sam)"
+        [void]$searcher.PropertiesToLoad.Add('objectcategory')
+        $r = $searcher.FindOne()
+        if (-not $r) { return $null }
+        $cat = [string]$r.Properties['objectcategory'][0]
+        return $(if ($cat -match '(?i)^CN=Group,') { 'Group' } else { 'User' })
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($searcher) { $searcher.Dispose() }
+    }
+}
+
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
 #   Читает Win32_Process; для каждого процесса определяет владельца (пользователя, запустившего процесс) методом
 #   GetOwner(), берёт время его запуска (Win32_Process.CreationDate) и для каждого уникального файла считает
@@ -699,6 +776,16 @@ $script:CollectScript = {
 #   параметр оставлен для тестов и на случай, если понадобится более осторожный режим "только gpupdate").
 #   $NotifyText - текст уведомления (без имени файла - оно подставляется автоматически).
 #   $LogoffSessions - завершать ли принудительно сеанс пользователя, у которого процесс был завершён ($true/$false).
+#   $RestrictOwnerSam - если не пусто, закрывать/уведомлять/завершать сеанс только у процессов, чей владелец
+#   (без имени домена) совпадает с этим именем без учёта регистра - используется для блокировки "по конкретному
+#   пользователю" (Scope=User), чтобы не закрыть легитимно запущенный тот же файл у ДРУГИХ пользователей
+#   компьютера, для которых правило SRP не действует. Для блокировки "по группе" такой проверки нет (сверить
+#   членство в группе можно было бы только обращением к AD с этого же компьютера, что не проверено на реальном
+#   домене - см. общую оговорку про недоказанные Windows-специфичные места в начале разговора) - поэтому для
+#   групп, как и для обычной блокировки на весь компьютер, закрываются все текущие запущенные экземпляры файла
+#   независимо от того, кто их запустил; постоянная защита (новые попытки запуска) при этом всё равно верно
+#   ограничена только членами группы - это даёт сама Security Filtering GPO (см. Set-GpoUserFiltering), а не
+#   этот скрипт.
 #   Возвращает объект { Computer, GpUpdate ("OK" или код), GpUpdateOutput (текст, который вывел gpupdate.exe -
 #   заполняется только при ненулевом коде, чтобы сразу видеть причину сбоя без похода за gpresult /h),
 #   TerminateRequested, Found (сколько запущенных экземпляров
@@ -718,7 +805,7 @@ $script:CollectScript = {
 #   запущенного экземпляра (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки
 #   им может быть уже другой пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
-    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false)
+    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false, $RestrictOwnerSam = '')
     $res = New-Object PSObject -Property @{
         Computer           = $env:COMPUTERNAME
         GpUpdate           = ''
@@ -757,11 +844,16 @@ $script:ApplyBlockScript = {
             $loggedOff = @{}
             foreach ($p in (Get-WmiObject -Class Win32_Process)) {
                 if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
+                    $owner = ''
+                    try { $o = $p.GetOwner(); if ($o.User) { $owner = $o.User } } catch { }
+                    if ($RestrictOwnerSam) {
+                        $ownerSam = $owner
+                        $slash = $owner.LastIndexOf('\')
+                        if ($slash -ge 0) { $ownerSam = $owner.Substring($slash + 1) }
+                        if ($ownerSam -ine $RestrictOwnerSam) { continue }
+                    }
                     $res.Found = $res.Found + 1
                     if ($TerminateProcesses) {
-                        $owner = ''
-                        try { $o = $p.GetOwner(); if ($o.User) { $owner = $o.User } } catch { }
-
                         $r = $p.Terminate()
                         if ($r.ReturnValue -eq 0) {
                             $res.Killed = $res.Killed + 1
@@ -826,9 +918,9 @@ function Start-Collection {
 #   -NotifyText  текст уведомления пользователю при завершении его процесса;
 #   -LogoffSessions  завершать ли принудительно сеанс пользователя после завершения его процесса. Возвращает задание.
 function Start-BlockApply {
-    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false)
+    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false, [string]$RestrictOwnerSam = '')
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
-        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions, $RestrictOwnerSam -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
 }
 
@@ -923,8 +1015,16 @@ function Receive-JobResults {
 #   HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Hashes\{GUID}
 # Требуется модуль GroupPolicy (RSAT: Group Policy Management) на машине администратора.
 
-# $script:SrpBase - раздел реестра политики SRP (в GPO он пишется в Registry.pol этого раздела).
+# $script:SrpBase - раздел реестра политики SRP в Computer Configuration (действует на всех пользователей
+#   компьютера - обычный режим блокировки).
 $script:SrpBase = 'HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
+# $script:SrpBaseUser - тот же раздел, но в User Configuration (HKCU): правило действует только там, где
+#   применяется ПОЛЬЗОВАТЕЛЬСКАЯ часть GPO, то есть для того, кто вошёл в систему под нужной учётной записью,
+#   независимо от того, на каком компьютере домена он это делает. Сама по себе запись хэша в User Configuration
+#   ничего не ограничивает по пользователю - фактическое ограничение "кому" даёт Security Filtering GPO
+#   (см. Set-GpoUserFiltering): без него правило действует на всех, кого достаёт привязка GPO, точно как в
+#   Computer Configuration.
+$script:SrpBaseUser = 'HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
 
 # $script:SrpHashAlg - код алгоритма хэша для значения HashAlg правила SRP (MD5=0x8003, SHA1=0x8004, SHA256=0x800C).
 $script:SrpHashAlg = @{ MD5 = 32771; SHA1 = 32772; SHA256 = 32780 }
@@ -969,9 +1069,37 @@ function Test-HashValue {
     return [bool]($Hash -match '^[0-9A-Fa-f]+$' -and $Hash.Length -eq $script:HashLength[$Algorithm])
 }
 
+# Set-GpoUserFiltering - настраивает Security Filtering GPO так, чтобы она (и записанные в неё правила User
+#   Configuration) применялась ТОЛЬКО к указанному пользователю/группе, а не ко всем ("Authenticated Users",
+#   которых New-GPO ставит по умолчанию). Без этого шага блокировка "по пользователю" на деле действовала бы
+#   на всех, кто попадает под привязку GPO - ровно как обычная, компьютерная. -GpoName  имя GPO;
+#   -PrincipalSam  sAMAccountName пользователя/группы; -PrincipalType  'User' или 'Group'.
+#   Идемпотентна: повторный вызов для уже настроенной GPO ничего не меняет.
+#   Локальные: $current - текущие права GPO; $hasApply - есть ли уже GpoApply у этого principal;
+#   $authUsersApply - есть ли ещё права на Apply у "Authenticated Users" (их нужно снять).
+function Set-GpoUserFiltering {
+    param(
+        [Parameter(Mandatory)][string]$GpoName,
+        [Parameter(Mandatory)][string]$PrincipalSam,
+        [Parameter(Mandatory)][ValidateSet('User', 'Group')][string]$PrincipalType
+    )
+    $current = @(Get-GPPermission -Name $GpoName -All -ErrorAction Stop)
+    $hasApply = $current | Where-Object { $_.Trustee.Name -eq $PrincipalSam -and $_.Permission -eq 'GpoApply' }
+    if (-not $hasApply) {
+        [void](Set-GPPermission -Name $GpoName -TargetName $PrincipalSam -TargetType $PrincipalType -PermissionLevel GpoApply -ErrorAction Stop)
+    }
+    $authUsersApply = $current | Where-Object { $_.Trustee.Name -eq 'Authenticated Users' -and $_.Permission -eq 'GpoApply' }
+    if ($authUsersApply) {
+        [void](Set-GPPermission -Name $GpoName -TargetName 'Authenticated Users' -TargetType Group -PermissionLevel None -ErrorAction Stop)
+    }
+}
+
 # Initialize-SrpGpo - готовит GPO к хранению правил: создаёт её, если нет; записывает базовые параметры
-#   SRP (если их ещё нет - существующие не перезаписываются); при необходимости привязывает к OU/домену.
-#   -GpoName  имя GPO; -LinkTarget  DN контейнера для привязки (пусто - не привязывать). Возвращает GPO.
+#   SRP (если их ещё нет - существующие не перезаписываются); при необходимости привязывает к OU/домену;
+#   если задан -PrincipalSam - ограничивает действие GPO только этим пользователем/группой (Set-GpoUserFiltering).
+#   -GpoName  имя GPO; -LinkTarget  DN контейнера для привязки (пусто - не привязывать);
+#   -PrincipalSam/-PrincipalType  см. Set-GpoUserFiltering (пусто - фильтрация не трогается, GPO действует на
+#   всех, как обычная компьютерная блокировка). Возвращает GPO.
 #   Локальные: $gpo - объект GPO; $hasBase - есть ли в GPO базовые настройки SRP;
 #   $base - раздел реестра; $linked - уже привязана ли GPO к контейнеру.
 #   Базовые значения: DefaultLevel=262144 ("Неограниченный": всё, что не запрещено, работает), TransparentEnabled=1,
@@ -979,7 +1107,14 @@ function Test-HashValue {
 function Initialize-SrpGpo {
     param(
         [Parameter(Mandatory)][string]$GpoName,
-        [string]$LinkTarget
+        [string]$LinkTarget,
+        [string]$PrincipalSam,
+        # Без ValidateSet: параметр необязательный, и при вызове без -PrincipalSam сюда часто передают пустую
+        # строку явно (например, Add-SrpHashBlock всегда передаёт своё $PrincipalType дальше) - ValidateSet
+        # отверг бы такой явный пустой вызов, хотя он корректен (значит "фильтрация не нужна"). Проверка набора
+        # 'User'/'Group' в любом случае происходит там, где это по-настоящему важно - в Set-GpoUserFiltering,
+        # куда $PrincipalType передаётся только если задан $PrincipalSam.
+        [string]$PrincipalType
     )
     Import-Module GroupPolicy -ErrorAction Stop
 
@@ -988,21 +1123,24 @@ function Initialize-SrpGpo {
         $gpo = New-GPO -Name $GpoName -Comment 'Блокировка процессов по хэшу (создано ProcessMonitor)' -ErrorAction Stop
     }
 
-    $hasBase = $true
-    try {
-        [void](Get-GPRegistryValue -Name $GpoName -Key $script:SrpBase -ValueName DefaultLevel -ErrorAction Stop)
-    }
-    catch {
-        $hasBase = $false
-    }
-    if (-not $hasBase) {
-        $base = $script:SrpBase
-        # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
+    # Базовые настройки SRP пишутся и в Computer, и в User Configuration одной и той же GPO - раздел, в который
+    # реально попадёт хэш-правило (см. Add-SrpHashBlock), определяется позже, отдельно для каждого правила.
+    foreach ($base in @($script:SrpBase, $script:SrpBaseUser)) {
+        $hasBase = $true
+        try {
+            [void](Get-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -ErrorAction Stop)
+        }
+        catch {
+            $hasBase = $false
+        }
+        if (-not $hasBase) {
+            # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
+            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
+            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
+            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
+            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
+            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
+        }
     }
 
     if ($LinkTarget) {
@@ -1012,16 +1150,23 @@ function Initialize-SrpGpo {
             [void](New-GPLink -Name $GpoName -Target $LinkTarget -ErrorAction Stop)
         }
     }
+    if ($PrincipalSam) {
+        Set-GpoUserFiltering -GpoName $GpoName -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType
+    }
     return $gpo
 }
 
 # Add-SrpHashBlock - добавляет в GPO хэш-правило уровня "Запрещено". Возвращает GUID правила "{xxxxxxxx-...}".
-#   -GpoName, -LinkTarget  GPO и привязка (см. Initialize-SrpGpo); -Name  имя файла (для описания правила);
-#   -Algorithm и -Hash  хэш; -Size  размер файла (SRP сверяет и его).
+#   -GpoName, -LinkTarget, -PrincipalSam, -PrincipalType  GPO, привязка и ограничение по пользователю/группе
+#   (см. Initialize-SrpGpo); -Name  имя файла (для описания правила); -Algorithm и -Hash  хэш; -Size  размер
+#   файла (SRP сверяет и его). -Scope  'Computer' (по умолчанию - правило в Computer Configuration, действует
+#   на всех пользователей компьютера) или 'User' (правило в User Configuration этой же GPO; реально ограничивает
+#   конкретного пользователя/группу только в сочетании с -PrincipalSam - без него это просьба "для всех", только
+#   записанная в другой раздел реестра).
 #   Значения правила в реестре: ItemData (хэш в байтах), ItemSize (размер), HashAlg (алгоритм), SaferFlags=0,
 #   LastModified (дата изменения), Description (описание).
-#   Локальные: $ruleId - GUID нового правила; $key - раздел реестра правила; $bytes - хэш в байтах;
-#   $description - текст описания.
+#   Локальные: $base - раздел реестра (Computer или User, в зависимости от -Scope); $ruleId - GUID нового
+#   правила; $key - раздел реестра правила; $bytes - хэш в байтах; $description - текст описания.
 function Add-SrpHashBlock {
     param(
         [Parameter(Mandatory)][string]$GpoName,
@@ -1029,15 +1174,19 @@ function Add-SrpHashBlock {
         [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
         [Parameter(Mandatory)][string]$Hash,
         [long]$Size,
-        [string]$LinkTarget
+        [string]$LinkTarget,
+        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
+        [string]$PrincipalSam,
+        [string]$PrincipalType          # см. комментарий у этого же параметра в Initialize-SrpGpo - без ValidateSet
     )
     if (-not (Test-HashValue -Algorithm $Algorithm -Hash $Hash)) {
         throw "Некорректный $Algorithm-хэш: '$Hash'."
     }
-    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget)
+    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType)
 
+    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
     $ruleId = [Guid]::NewGuid().ToString('B')
-    $key = '{0}\0\Hashes\{1}' -f $script:SrpBase, $ruleId
+    $key = '{0}\0\Hashes\{1}' -f $base, $ruleId
     $bytes = ConvertFrom-HexString -Hex $Hash
 
     $description = '{0} (добавлено ProcessMonitor {1})' -f $Name, (Get-Date).ToString('yyyy-MM-dd')
@@ -1050,7 +1199,9 @@ function Add-SrpHashBlock {
     return $ruleId
 }
 
-# Remove-SrpHashBlock - удаляет правило из GPO по его GUID. -GpoName  имя GPO; -RuleId  GUID из журнала блокировок.
+# Remove-SrpHashBlock - удаляет правило из GPO по его GUID. -GpoName  имя GPO; -RuleId  GUID из журнала блокировок;
+#   -Scope  в каком разделе искать правило - 'Computer' (по умолчанию, для совместимости со старыми записями
+#   журнала, у которых поля Scope ещё не было) или 'User' (см. Add-SrpHashBlock).
 # Get-GpoLinkSummary - сколько у GPO реальных привязок (Link) к OU/домену и сколько из них включено.
 #   Читает отчёт GPO (GenerateReport) и считает узлы <LinksTo> - именно по ним gpupdate на клиенте решает,
 #   какие GPO вообще обрабатывать; DefaultLevel/Hashes внутри самой GPO не играют роли, если привязок нет.
@@ -1077,10 +1228,12 @@ function Get-GpoLinkSummary {
 function Remove-SrpHashBlock {
     param(
         [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$RuleId
+        [Parameter(Mandatory)][string]$RuleId,
+        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer'
     )
     Import-Module GroupPolicy -ErrorAction Stop
-    $key = '{0}\0\Hashes\{1}' -f $script:SrpBase, $RuleId
+    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
+    $key = '{0}\0\Hashes\{1}' -f $base, $RuleId
     [void](Remove-GPRegistryValue -Name $GpoName -Key $key -ErrorAction Stop)
 }
 
@@ -1610,14 +1763,24 @@ $tabProcesses.Controls.Add($procBar)
 
 # --- Вкладка "Блокировки" --------------------------------------------------
 # Вкладка "Блокировки":
-#   $blockBar - панель инструментов; $script:GpoBox - имя GPO, в которую добавляются правила;
+#   $blockBar - панель инструментов; $script:GpoBox - имя GPO, в которую добавляются правила (для блокировки
+#   "по пользователю/группе" - базовое имя, к нему автоматически добавляется суффикс с принципалом, см.
+#   Resolve-BlockTarget - у каждого пользователя/группы своя отдельная GPO);
 #   $script:LinkCombo - DN контейнера, к которому привязать GPO (необязательно); редактируемый выпадающий
 #   список: можно вставить/набрать DN вручную, а можно выбрать OU из списка, который загружает $btnLoadOUs
 #   (см. Import-AdOUs) - пункты показываются как "Имя OU — DN", а при блокировке используется только DN
 #   (после последнего " — " в тексте поля; если разделителя нет - весь текст считается DN, как раньше).
+#   $script:ScopeCombo - "Все пользователи компьютера" (обычная блокировка, как раньше) или "Пользователь/группа
+#   AD" - тогда правило SRP пишется в User Configuration той же GPO, а Security Filtering GPO ограничивается
+#   принципалом из $script:PrincipalCombo (см. Set-GpoUserFiltering), так что оно реально действует только на
+#   него/неё, а не на всех, кого достаёт привязка. $script:PrincipalCombo - sAMAccountName пользователя/группы;
+#   редактируемый выпадающий список, как $script:LinkCombo, заполняется $btnLoadPrincipals (Import-AdPrincipals)
+#   пунктами "sam — имя [пользователь/группа]"; включается/выключается при смене $script:ScopeCombo.
 #   На известных компьютерах (где файл встречался в последнем сканировании) блокировка автоматически: обновляет
 #   политики (gpupdate), завершает уже запущенные экземпляры файла и показывает каждому затронутому пользователю
-#   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков.
+#   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков. Для
+#   блокировки по конкретному пользователю это закрытие тоже ограничено им (владелец процесса сверяется -
+#   см. $script:ApplyBlockScript); для группы - нет, см. предупреждение в Invoke-BlockSelected.
 #   $btnUnblock - "Снять блокировку"; $btnCheckEvents - "Проверить срабатывания" (ищет в журнале событий Windows
 #   попытки запуска заблокированного файла после даты блокировки - см. Invoke-CheckBlockEvents, там же оговорка
 #   про недоказанность кодов событий); $script:BlockGrid - таблица всех блокировок.
@@ -1626,16 +1789,29 @@ $blockBar = New-Toolbar
 $script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
 $script:LinkCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 340; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
 $btnLoadOUs = New-Button 'Загрузить OU из AD' 160
+$script:ScopeCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 200; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
+[void]$script:ScopeCombo.Items.AddRange(@('Все пользователи компьютера', 'Пользователь/группа AD'))
+$script:ScopeCombo.SelectedIndex = 0
+$script:PrincipalCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 300; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)); Enabled = $false }
+$btnLoadPrincipals = New-Button 'Загрузить пользователей/группы из AD' 230
+$btnLoadPrincipals.Enabled = $false
 $btnUnblock = New-Button 'Снять блокировку' 140
 $btnCheckEvents = New-Button 'Проверить срабатывания' 190
 $blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, можно выбрать из списка):'), $script:LinkCombo,
-        $btnLoadOUs, $btnUnblock, $btnCheckEvents))
+        $btnLoadOUs, (New-Label 'Область:'), $script:ScopeCombo, (New-Label 'Пользователь/группа:'), $script:PrincipalCombo,
+        $btnLoadPrincipals, $btnUnblock, $btnCheckEvents))
+$script:ScopeCombo.Add_SelectedIndexChanged({
+        $isUser = [string]$script:ScopeCombo.SelectedItem -eq 'Пользователь/группа AD'
+        $script:PrincipalCombo.Enabled = $isUser
+        $btnLoadPrincipals.Enabled = $isUser
+    })
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
 Add-GridColumn $script:BlockGrid 'Имя' 'Name' 160
 Add-GridColumn $script:BlockGrid 'Алгоритм' 'Algorithm' 70
 Add-GridColumn $script:BlockGrid 'Хэш' 'Hash' 330 -Mono
+Add-GridColumn $script:BlockGrid 'Применяется к' 'Target' 160
 Add-GridColumn $script:BlockGrid 'Срабатываний' 'Occurrences' 100
 Add-GridColumn $script:BlockGrid 'Последнее срабатывание' 'LastEventTime' 150
 Add-GridColumn $script:BlockGrid 'Статус' 'Status' 80
@@ -1782,6 +1958,52 @@ function ConvertTo-LinkTargetDn {
     $sep = $Text.LastIndexOf(' — ')
     if ($sep -ge 0) { return $Text.Substring($sep + 3).Trim() }
     return $Text
+}
+
+# Import-AdPrincipals - обработчик "Загрузить пользователей/группы из AD": заполняет $script:PrincipalCombo
+#   списком "sam — отображаемое имя [пользователь|группа]", сохраняя уже введённый пользователем текст поля.
+#   $kept - текст поля до обновления; $items - полученные пользователи и группы (см. Get-AdUsersAndGroups).
+function Import-AdPrincipals {
+    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        Set-Status 'Запрос пользователей и групп из AD...'
+        $kept = $script:PrincipalCombo.Text
+        $items = @(Get-AdUsersAndGroups)
+        $script:PrincipalCombo.Items.Clear()
+        foreach ($p in $items) {
+            $typeLabel = if ($p.Type -eq 'Group') { 'группа' } else { 'пользователь' }
+            [void]$script:PrincipalCombo.Items.Add(('{0} — {1} [{2}]' -f $p.Sam, $p.Display, $typeLabel))
+        }
+        $script:PrincipalCombo.Text = $kept
+        Write-Log "Из AD получено пользователей и групп: $($items.Count)"
+        Set-Status "Из AD получено пользователей и групп: $($items.Count)"
+    }
+    catch {
+        Write-Log "Ошибка запроса пользователей/групп из AD: $($_.Exception.Message)"
+        Show-Message -Text "Не удалось получить список пользователей и групп из AD:`n$($_.Exception.Message)" -Icon Error
+        Set-Status 'Ошибка запроса пользователей/групп из AD'
+    }
+    finally {
+        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+}
+
+# ConvertTo-PrincipalInfo - разбирает текст поля "Пользователь/группа" на sAMAccountName и тип.
+#   Если текст выбран из списка (формат "sam — имя [пользователь]" или "... [группа]", см. Import-AdPrincipals) -
+#   оба значения известны сразу, без обращения к AD. Если текст набран вручную (просто sam, без " — " и
+#   "[...]") - Type возвращается $null, и вызывающий код должен сам определить тип (Resolve-AdPrincipalType)
+#   перед тем, как писать правило в GPO. -Text содержимое поля.
+function ConvertTo-PrincipalInfo {
+    param([string]$Text)
+    $Text = $Text.Trim()
+    $type = $null
+    if ($Text -match '\[(пользователь|группа)\]\s*$') {
+        $type = if ($matches[1] -eq 'группа') { 'Group' } else { 'User' }
+        $Text = $Text.Substring(0, $Text.Length - $matches[0].Length).TrimEnd()
+    }
+    $sep = $Text.IndexOf(' — ')
+    $sam = if ($sep -ge 0) { $Text.Substring(0, $sep).Trim() } else { $Text }
+    [pscustomobject]@{ Sam = $sam; Type = $type }
 }
 
 # ---------------------------------------------------------------------------
@@ -1951,6 +2173,58 @@ function Update-BlockGrid {
     $script:BlockGrid.DataSource = (Get-BlockTable).DefaultView
 }
 
+# Resolve-BlockTarget - читает элементы управления "Область" ($script:ScopeCombo) и "Пользователь/группа"
+#   ($script:PrincipalCombo) и возвращает, для кого ставится блокировка: вся машина (по умолчанию) или
+#   конкретный пользователь/группа AD. Используется и в Invoke-BlockSelected, и в Invoke-BlockSelectedBatch -
+#   поля на вкладке "Блокировки" общие для всего приложения, как GPO и привязка.
+#   -BaseGpoName  имя GPO из поля "GPO" (для компьютерной блокировки используется как есть; для блокировки
+#   по пользователю/группе к нему добавляется суффикс с именем принципала - у каждого пользователя/группы
+#   своя отдельная GPO, см. Set-GpoUserFiltering, иначе Security Filtering одной GPO ограничивала бы
+#   действие сразу всех её правил одним и тем же набором людей).
+#   Возвращает { Scope = 'Computer'/'User'; PrincipalSam; PrincipalType; Target (текст для журнала/таблицы);
+#   GpoName (реальное имя GPO для Add-SrpHashBlock/Get-GpoLinkSummary) } или $null, если выбран режим
+#   "Пользователь/группа", но поле не заполнено или тип принципала не определён - в этом случае сообщение
+#   уже показано (Show-Message), вызывающий код должен просто остановиться (return).
+#   Локальные: $scopeSelected - выбранный пункт $script:ScopeCombo; $text - текст поля принципала;
+#   $info - разбор текста (ConvertTo-PrincipalInfo); $type - его тип (из текста или Resolve-AdPrincipalType);
+#   $typeLabel - "Пользователь"/"Группа" для отображения.
+function Resolve-BlockTarget {
+    param([Parameter(Mandatory)][string]$BaseGpoName)
+
+    $scopeSelected = [string]$script:ScopeCombo.SelectedItem
+    if ($scopeSelected -ne 'Пользователь/группа AD') {
+        return [pscustomobject]@{
+            Scope = 'Computer'; PrincipalSam = ''; PrincipalType = $null
+            Target = 'Все пользователи компьютера'; GpoName = $BaseGpoName
+        }
+    }
+
+    $text = $script:PrincipalCombo.Text.Trim()
+    if (-not $text) {
+        Show-Message -Icon Warning -Text ('Укажите пользователя или группу в поле "Пользователь/группа", или ' +
+            'выберите в поле "Область" пункт "Все пользователи компьютера".')
+        return $null
+    }
+    $info = ConvertTo-PrincipalInfo -Text $text
+    $type = $info.Type
+    if (-not $type) { $type = Resolve-AdPrincipalType -Sam $info.Sam }
+    if (-not $type) {
+        Show-Message -Icon Error -Text (
+            "Не удалось определить, пользователь это или группа: `"$($info.Sam)`".`n`n" +
+            'Нажмите "Загрузить пользователей/группы из AD" и выберите нужную запись из списка, либо проверьте правильность имени.'
+        )
+        return $null
+    }
+    $typeLabel = if ($type -eq 'Group') { 'Группа' } else { 'Пользователь' }
+    [pscustomobject]@{
+        Scope         = 'User'
+        PrincipalSam  = $info.Sam
+        PrincipalType = $type
+        Target        = "${typeLabel}: $($info.Sam)"
+        GpoName       = "$BaseGpoName - ${typeLabel}: $($info.Sam)"
+    }
+}
+
 # Invoke-BlockSelected - обработчик "Заблокировать по хэшу...". Порядок действий:
 #   1) проверки (выбрана строка, указана GPO, хэш корректен, файл не в Windows\, есть модуль GroupPolicy,
 #      блокировка ещё не действует); 1а) если у GPO нет ни одной включённой привязки (Link) и поле "Привязать
@@ -1981,10 +2255,10 @@ function Invoke-BlockSelected {
     $path = [string]$row['Path']
     $size = 0L
     if ($row['Size'] -isnot [DBNull]) { $size = [long]$row['Size'] }
-    $gpo = $script:GpoBox.Text.Trim()
+    $gpoBase = $script:GpoBox.Text.Trim()
     $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
 
-    if (-not $gpo) {
+    if (-not $gpoBase) {
         Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
         return
     }
@@ -2004,6 +2278,9 @@ function Invoke-BlockSelected {
         Show-Message -Text 'Для этого хэша блокировка уже активна (см. вкладку "Блокировки").'
         return
     }
+    $target = Resolve-BlockTarget -BaseGpoName $gpoBase
+    if (-not $target) { return }
+    $gpo = $target.GpoName
 
     # Привязка (Link) GPO к OU/домену - то, от чего реально зависит, подействует ли правило: без привязки
     # gpupdate на клиенте даже не возьмёт эту GPO в обработку, сколько бы хэшей в ней ни было добавлено.
@@ -2026,20 +2303,26 @@ function Invoke-BlockSelected {
     $locations = Get-HashLocations -Algorithm $algorithm -Hash $hash
     $computerCount = @($locations.Rows | ForEach-Object { $_.Computer } | Select-Object -Unique).Count
     $notifyText = $script:NotifyTemplate -f $name
-    $message = "Заблокировать запуск файла по хэшу?`n`nИмя: $name`n${algorithm}: $hash`nРазмер: $size байт`nПример пути: $path`nНайден на компьютерах (последнее сканирование): $computerCount`n`nGPO: $gpo"
+    $message = "Заблокировать запуск файла по хэшу?`n`nИмя: $name`n${algorithm}: $hash`nРазмер: $size байт`nПример пути: $path`nНайден на компьютерах (последнее сканирование): $computerCount`n`nПрименяется к: $($target.Target)`nGPO: $gpo"
     if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
     else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
     if ($computerCount -gt 0) {
         $message += "`n`nНа этих компьютерах сразу после добавления правила: обновятся политики (gpupdate), будут" +
             " закрыты уже запущенные экземпляры файла, а их пользователям будет показано сообщение:`n`"$notifyText`""
+        if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'Group') {
+            $message += "`n`nЗакрытие коснётся ВСЕХ, кто сейчас запустил этот файл, а не только членов группы " +
+                "`"$($target.PrincipalSam)`" - проверить членство в группе при немедленном завершении приложение не " +
+                "умеет. Сама блокировка новых запусков при этом действует правильно - только на членов группы."
+        }
     }
     if (-not (Confirm-Action -Text $message -Title 'Блокировка по хэшу')) { return }
 
     $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
-        $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LinkTarget $linkTarget
-        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -GpoName $gpo -RuleId $ruleId
-        Write-Log "Блокировка добавлена: $name ($algorithm $hash), GPO '$gpo', правило $ruleId"
+        $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LinkTarget $linkTarget `
+            -Scope $target.Scope -PrincipalSam $target.PrincipalSam -PrincipalType $target.PrincipalType
+        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -GpoName $gpo -RuleId $ruleId -Scope $target.Scope -Target $target.Target
+        Write-Log "Блокировка добавлена: $name ($algorithm $hash), применяется к: $($target.Target), GPO '$gpo', правило $ruleId"
         if ($willBeUnlinked) {
             Write-Log "ВНИМАНИЕ: GPO '$gpo' не привязана ни к одному OU/домену - блокировка НЕ действует, пока вы её не привяжете (поле `"Привязать к`" или вручную в GPMC)."
         }
@@ -2070,12 +2353,13 @@ function Invoke-BlockSelected {
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             $map[$key] += [string]$loc.Path
         }
+        $restrictOwnerSam = if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'User') { $target.PrincipalSam } else { '' }
         $action = 'gpupdate + завершение процессов + уведомление'
         if ($logoffSessions) { $action += ' + завершение сеанса' }
         Write-Log "Применение на $($map.Count) компьютерах ($action)..."
         Set-Status "Применение блокировки на $($map.Count) компьютерах..."
         try {
-            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions
+            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions -RestrictOwnerSam $restrictOwnerSam
             Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
         }
         catch {
@@ -2139,10 +2423,10 @@ function Invoke-BlockSelectedBatch {
     param([Parameter(Mandatory)][object[]]$Rows)
 
     $algorithm = [string]$script:AlgoCombo.SelectedItem
-    $gpo = $script:GpoBox.Text.Trim()
+    $gpoBase = $script:GpoBox.Text.Trim()
     $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
 
-    if (-not $gpo) {
+    if (-not $gpoBase) {
         Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
         return
     }
@@ -2150,6 +2434,10 @@ function Invoke-BlockSelectedBatch {
         Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy. Установите на этом компьютере компонент "Group Policy Management" (RSAT).'
         return
     }
+    $target = Resolve-BlockTarget -BaseGpoName $gpoBase
+    if (-not $target) { return }
+    $gpo = $target.GpoName
+    $restrictOwnerSam = if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'User') { $target.PrincipalSam } else { '' }
 
     $seen = @{}
     $toBlock = New-Object System.Collections.ArrayList
@@ -2198,13 +2486,18 @@ function Invoke-BlockSelectedBatch {
     }
 
     $message = "Заблокировать запуск $($toBlock.Count) файлов по хэшу?`n`n" +
-        (($toBlock | ForEach-Object { "  - $($_.Name)" }) -join "`n") + "`n`nGPO: $gpo"
+        (($toBlock | ForEach-Object { "  - $($_.Name)" }) -join "`n") + "`n`nПрименяется к: $($target.Target)`nGPO: $gpo"
     if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
     else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
     if ($skipped.Count -gt 0) { $message += "`n`nПропущено ($($skipped.Count)):`n" + ($skipped -join "`n") }
     $message += "`n`nНа компьютерах, где эти файлы встречались в последнем сканировании, сразу после добавления " +
         "правил: обновятся политики (gpupdate), будут закрыты уже запущенные экземпляры, а их пользователям " +
         "будет показано уведомление."
+    if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'Group') {
+        $message += "`n`nЗакрытие коснётся ВСЕХ, кто сейчас запустил эти файлы, а не только членов группы " +
+            "`"$($target.PrincipalSam)`" - членство в группе при немедленном завершении не проверяется. Сама " +
+            "блокировка новых запусков действует правильно - только на членов группы."
+    }
     if (-not (Confirm-Action -Text $message -Title "Блокировка по хэшу ($($toBlock.Count) файлов)")) { return }
 
     $anyLocations = $false
@@ -2226,9 +2519,10 @@ function Invoke-BlockSelectedBatch {
     try {
         foreach ($item in $toBlock) {
             try {
-                $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LinkTarget $linkTarget
-                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -GpoName $gpo -RuleId $ruleId
-                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash)), GPO '$gpo', правило $ruleId"
+                $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LinkTarget $linkTarget `
+                    -Scope $target.Scope -PrincipalSam $target.PrincipalSam -PrincipalType $target.PrincipalType
+                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -GpoName $gpo -RuleId $ruleId -Scope $target.Scope -Target $target.Target
+                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash)), применяется к: $($target.Target), GPO '$gpo', правило $ruleId"
                 $blocked++
             }
             catch {
@@ -2246,7 +2540,7 @@ function Invoke-BlockSelectedBatch {
             }
             $notifyText = $script:NotifyTemplate -f $item.Name
             try {
-                $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions
+                $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions -RestrictOwnerSam $restrictOwnerSam
                 Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
             }
             catch {
@@ -2281,12 +2575,12 @@ function Invoke-UnblockSelected {
         Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy (RSAT).'
         return
     }
-    $text = "Снять блокировку?`n`nИмя: $($row['Name'])`n$($row['Algorithm']): $($row['Hash'])`nGPO: $($row['GpoName'])"
+    $text = "Снять блокировку?`n`nИмя: $($row['Name'])`n$($row['Algorithm']): $($row['Hash'])`nПрименяется к: $($row['Target'])`nGPO: $($row['GpoName'])"
     if (-not (Confirm-Action -Text $text -Title 'Снятие блокировки')) { return }
 
     $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
-        Remove-SrpHashBlock -GpoName ([string]$row['GpoName']) -RuleId ([string]$row['RuleId'])
+        Remove-SrpHashBlock -GpoName ([string]$row['GpoName']) -RuleId ([string]$row['RuleId']) -Scope ([string]$row['Scope'])
         Disable-BlockRecord -Id ([int]$row['Id'])
         Write-Log "Блокировка снята: $($row['Name']) ($($row['Algorithm']) $($row['Hash']))"
         Update-BlockGrid
@@ -2443,6 +2737,7 @@ $btnBlock.Add_Click({
         else { Invoke-BlockSelected }
     })
 $btnLoadOUs.Add_Click({ Import-AdOUs })
+$btnLoadPrincipals.Add_Click({ Import-AdPrincipals })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
 $btnCheckEvents.Add_Click({ Invoke-CheckBlockEvents })
 $btnOpenLog.Add_Click({
