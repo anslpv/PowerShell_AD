@@ -609,26 +609,33 @@ $script:CollectScript = {
 #   принудительно обновляет групповые политики (gpupdate /target:computer /force), чтобы правило SRP подействовало
 #   немедленно, а не ждало планового обновления (по умолчанию - до 90 минут), затем ЗАВЕРШАЕТ уже запущенные
 #   экземпляры заблокированного файла и показывает каждому затронутому пользователю на экране (msg.exe) короткое
-#   уведомление, что запускать это нельзя. Всё это происходит автоматически при блокировке, без отдельных флажков.
+#   уведомление, что запускать это нельзя. По отдельному запросу (-LogoffSessions, администратор подтверждает его
+#   каждый раз в окне блокировки) ПОСЛЕ уведомления также принудительно завершает сеанс (logoff.exe) именно того
+#   пользователя, у кого был открыт процесс, - это закрывает ВСЕ его программы на этом компьютере, не только
+#   заблокированный файл, поэтому не делается по умолчанию. Всё это происходит автоматически при блокировке.
 #   $Map  - хэш-таблица "ИМЯ КОМПЬЮТЕРА (в верхнем регистре) -> массив путей к файлу".
 #   $TerminateProcesses - завершать ли найденные запущенные экземпляры ($true/$false; UI всегда передаёт $true,
 #   параметр оставлен для тестов и на случай, если понадобится более осторожный режим "только gpupdate").
 #   $NotifyText - текст уведомления (без имени файла - оно подставляется автоматически).
+#   $LogoffSessions - завершать ли принудительно сеанс пользователя, у которого процесс был завершён ($true/$false).
 #   Возвращает объект { Computer, GpUpdate ("OK" или код), TerminateRequested, Found (сколько запущенных экземпляров
 #   найдено - считается независимо от TerminateRequested), Killed (сколько реально завершено),
-#   Notified (скольким пользователям показано уведомление - один раз на пользователя, даже если у него несколько
-#   запущенных экземпляров), FailReasons (причины неудач метода Terminate, без повторов), Error }.
+#   Notified (скольким пользователям показано уведомление), LoggedOff (сколько сеансов принудительно завершено -
+#   один раз на сеанс (SessionId), даже если в нём было несколько запущенных экземпляров), FailReasons (причины
+#   неудач метода Terminate, без повторов), Error }.
 #   Found может быть больше Killed: причина - в FailReasons (чаще всего нет прав на завершение процесса).
 #   Found = 0 при непустом $paths значит, что на момент применения процесс с таким путём уже не запущен
-#   (завершился сам, или путь в данных сканирования устарел). Уведомление отправляется, только если процесс
-#   реально завершён (TRUE Kill), и только один раз на пользователя, даже если он держал открытыми несколько копий.
+#   (завершился сам, или путь в данных сканирования устарел). Уведомление и завершение сеанса выполняются, только
+#   если процесс реально завершён (TRUE Kill), и только один раз на пользователя/сеанс, даже если он держал
+#   открытыми несколько копий файла.
 #   Локальные: $res - возвращаемый результат; $paths - пути, по которым ищем запущенные экземпляры;
-#   $reasonMap - код возврата Terminate() -> текст причины; $notified - кому уведомление уже отправлено в этом
-#   запуске (защита от дублей); $p - процесс из WMI; $owner - владелец именно этого запущенного экземпляра
-#   (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки им может быть уже другой
-#   пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
+#   $reasonMap - код возврата Terminate() -> текст причины; $notified - кому уведомление уже отправлено;
+#   $loggedOff - какие сеансы (SessionId) уже завершены в этом запуске (защита от дублей, если у пользователя
+#   было несколько запущенных экземпляров в одном сеансе); $p - процесс из WMI; $owner - владелец именно этого
+#   запущенного экземпляра (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки
+#   им может быть уже другой пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
-    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.')
+    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false)
     $res = New-Object PSObject -Property @{
         Computer           = $env:COMPUTERNAME
         GpUpdate           = ''
@@ -636,6 +643,7 @@ $script:ApplyBlockScript = {
         Found              = 0
         Killed             = 0
         Notified           = 0
+        LoggedOff          = 0
         FailReasons        = ''
         Error              = ''
     }
@@ -655,6 +663,7 @@ $script:ApplyBlockScript = {
         if ($paths.Count -gt 0) {
             $reasons = @{}
             $notified = @{}
+            $loggedOff = @{}
             foreach ($p in (Get-WmiObject -Class Win32_Process)) {
                 if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
                     $res.Found = $res.Found + 1
@@ -670,6 +679,14 @@ $script:ApplyBlockScript = {
                                 try {
                                     & "$env:windir\System32\msg.exe" $owner /TIME:30 $NotifyText 2>&1 | Out-Null
                                     if ($LASTEXITCODE -eq 0) { $res.Notified = $res.Notified + 1 }
+                                }
+                                catch { }
+                            }
+                            if ($LogoffSessions -and -not $loggedOff.ContainsKey([int]$p.SessionId)) {
+                                $loggedOff[[int]$p.SessionId] = $true
+                                try {
+                                    & "$env:windir\System32\logoff.exe" $p.SessionId 2>&1 | Out-Null
+                                    if ($LASTEXITCODE -eq 0) { $res.LoggedOff = $res.LoggedOff + 1 }
                                 }
                                 catch { }
                             }
@@ -710,15 +727,17 @@ function Start-Collection {
         -AsJob -JobName 'ProcMon-Collect'
 }
 
-# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик, завершение процессов и
-#   уведомление пользователей) на компьютерах, где найден заблокированный файл.
+# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик, завершение процессов,
+#   уведомление и, по желанию, принудительное завершение сеанса пользователей) на компьютерах, где найден
+#   заблокированный файл.
 #   -Map  "ИМЯ КОМПЬЮТЕРА -> пути к файлу" (ключи Map - список компьютеров);
 #   -TerminateProcesses  завершать ли найденные запущенные экземпляры;
-#   -NotifyText  текст уведомления пользователю при завершении его процесса. Возвращает задание.
+#   -NotifyText  текст уведомления пользователю при завершении его процесса;
+#   -LogoffSessions  завершать ли принудительно сеанс пользователя после завершения его процесса. Возвращает задание.
 function Start-BlockApply {
-    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText)
+    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false)
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
-        -ArgumentList $Map, $TerminateProcesses, $NotifyText -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
 }
 
@@ -1742,7 +1761,9 @@ function Update-BlockGrid {
 #   привязка сейчас; $willBeUnlinked - после этого раза привязки по-прежнему не будет; $locations - где хэш
 #   найден; $computerCount - на скольких компьютерах; $notifyText - готовый текст уведомления (имя файла
 #   подставлено); $message - текст подтверждения; $ruleId - GUID созданного правила; $map - "компьютер -> пути"
-#   для применения; $loc, $key - элемент и ключ при его построении; $job - фоновое задание применения.
+#   для применения; $loc, $key - элемент и ключ при его построении; $logoffSessions - ответ администратора на
+#   отдельный вопрос про принудительное завершение сеанса (спрашивается только когда есть что завершать);
+#   $job - фоновое задание применения.
 function Invoke-BlockSelected {
     if (-not $script:ProcGrid.CurrentRow -or -not $script:ProcGrid.CurrentRow.DataBoundItem) {
         Show-Message -Text 'Выберите строку с процессом в таблице.' -Icon Warning
@@ -1829,16 +1850,27 @@ function Invoke-BlockSelected {
     }
 
     if ($locations.Rows.Count -gt 0) {
+        # Отдельный вопрос про завершение сеанса - более серьёзное действие, чем закрытие одного процесса
+        # (закрывает ВСЕ программы пользователя на этом компьютере), поэтому спрашивается явно каждый раз,
+        # с ответом "Нет" по умолчанию (см. Confirm-Action).
+        $logoffSessions = Confirm-Action -Title 'Завершение сеанса пользователя' -Text (
+            "Процесс будет закрыт на найденных компьютерах. Нужно ли дополнительно принудительно завершить сеанс " +
+            "пользователя(ей), у которых он был открыт (в целях безопасности и предотвращения нарушений)?`n`n" +
+            "Это закроет ВСЕ открытые у них программы на этом компьютере, а не только заблокированный файл, и они " +
+            "будут немедленно отключены от сеанса."
+        )
         $map = @{}
         foreach ($loc in $locations.Rows) {
             $key = ([string]$loc.Computer).ToUpper()
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             $map[$key] += [string]$loc.Path
         }
-        Write-Log "Применение на $($map.Count) компьютерах (gpupdate + завершение процессов + уведомление)..."
+        $action = 'gpupdate + завершение процессов + уведомление'
+        if ($logoffSessions) { $action += ' + завершение сеанса' }
+        Write-Log "Применение на $($map.Count) компьютерах ($action)..."
         Set-Status "Применение блокировки на $($map.Count) компьютерах..."
         try {
-            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText
+            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions
             Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
         }
         catch {
@@ -1862,6 +1894,7 @@ function Complete-BlockApply {
         $line = "[{0}] gpupdate: {1}" -f $r.Computer, $r.GpUpdate
         if ($r.TerminateRequested) {
             $line += "; найдено запущенных: {0}; завершено: {1}; уведомлено пользователей: {2}" -f $r.Found, $r.Killed, $r.Notified
+            if ($r.LoggedOff -gt 0) { $line += "; завершено сеансов: {0}" -f $r.LoggedOff }
             if ($r.Found -gt $r.Killed -and $r.FailReasons) { $line += "; не завершено из-за: $($r.FailReasons)" }
             if ($r.Found -eq 0) { $line += ' (на момент применения процесс уже не был запущен)' }
         }
