@@ -827,26 +827,46 @@ $script:ApplyBlockScript = {
         21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
-        # По умолчанию PowerShell перекодирует вывод консольных программ по значению $OutputEncoding, которое в
-        # сеансе без настоящей консоли (а именно так выполняется этот скрипт - через Invoke-Command/WinRM) может
-        # не совпадать с реальной кодовой страницей, в которой gpupdate.exe печатает текст (OEM, не ANSI/UTF-8) -
-        # из-за этого кириллица в выводе превращается в "кракозябры". Берём настоящую OEM-кодовую страницу этого
-        # компьютера из реестра (как это делает сам chcp.com) и используем именно её; если почему-либо не
-        # получилось - молча остаёмся на прежнем поведении, не ломая остальную часть применения блокировки.
+        # Предыдущая попытка (через $OutputEncoding перед обычным "& gpupdate.exe ... | Out-String") не помогла -
+        # $OutputEncoding управляет тем, в какой кодировке PowerShell ОТПРАВЛЯЕТ текст НА ВХОД внешней программе,
+        # а не тем, как он РАСШИФРОВЫВАЕТ её вывод, так что к этой задаче он вообще не относился. Вместо того
+        # чтобы полагаться на то, как PowerShell сам решает читать вывод консольной программы (через [Console]::
+        # OutputEncoding, которого в сеансе без настоящей консоли - а именно так выполняется этот скрипт, через
+        # Invoke-Command/WinRM - может не быть вовсе), запускаем gpupdate.exe напрямую через .NET
+        # System.Diagnostics.Process и явно задаём кодировку чтения его stdout/stderr сами - это не зависит от
+        # наличия консоли и от того, что в неё "думает" PowerShell. Кодировка - настоящая OEM-кодовая страница
+        # этого компьютера (та, в которой консольные программы печатают текст), берётся из реестра, как это
+        # делает сам chcp.com; если почему-либо не получилось определить - используется кодировка по умолчанию
+        # (тогда кириллица может остаться нечитаемой, но код возврата и остальная часть применения блокировки
+        # всё равно отработают).
+        $oemEncoding = [System.Text.Encoding]::Default
         try {
             $oemCp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP
-            $OutputEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
+            $oemEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
         }
         catch { }
 
-        $gpOut = & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "$env:windir\System32\gpupdate.exe"
+        $psi.Arguments = '/target:computer /force'
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $oemEncoding
+        $psi.StandardErrorEncoding = $oemEncoding
+        $gpProc = [System.Diagnostics.Process]::Start($psi)
+        $gpStdOut = $gpProc.StandardOutput.ReadToEnd()
+        $gpStdErr = $gpProc.StandardError.ReadToEnd()
+        $gpProc.WaitForExit()
+        $gpExitCode = $gpProc.ExitCode
+
+        if ($gpExitCode -eq 0) {
             $res.GpUpdate = 'OK'
         }
         else {
-            $res.GpUpdate = 'код ' + $LASTEXITCODE
+            $res.GpUpdate = 'код ' + $gpExitCode
             # Выводим реальный текст gpupdate.exe, чтобы ненулевой код было видно сразу в журнале, без похода за gpresult /h на сам компьютер.
-            $res.GpUpdateOutput = ($gpOut -replace '[\r\n]+', ' ').Trim()
+            $res.GpUpdateOutput = (($gpStdOut + $gpStdErr) -replace '[\r\n]+', ' ').Trim()
         }
 
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
