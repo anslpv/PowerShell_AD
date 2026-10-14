@@ -9,7 +9,10 @@
       * по WinRM собирает запущенные процессы и их хэши (MD5 / SHA1 / SHA256);
       * показывает таблицу |№|Время запуска процесса|Имя|Хэш| (плюс компьютер, пользователь и путь) и хранит
         историю в JSON-файлах;
-      * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO.
+      * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO, по одной или сразу нескольким
+        строкам;
+      * умеет проверять по журналу событий Windows, не пытались ли запускать уже заблокированный файл;
+      * умеет сканировать компьютеры по расписанию без окна (-ScheduledScan, см. README.md).
 
     Скрипт самодостаточный (один файл), сторонних драйверов не требует.
     Подробности и требования - в README.md.
@@ -20,26 +23,36 @@
 
 .PARAMETER DataPath
     Папка для JSON-файлов с данными. По умолчанию data рядом со скриптом. Прежнее имя -DbPath работает как псевдоним.
+
+.PARAMETER ScheduledScan
+    Не открывать окно, а выполнить одно сканирование компьютеров из сохранённого списка (вкладка "Компьютеры",
+    кнопка "Сохранить список для плановых сканирований") и сразу завершиться. Для запуска по расписанию
+    (Планировщик заданий Windows) без присутствия человека за экраном. Результат - только в файле журнала
+    (data\logs\processmonitor.log), на экран ничего не выводится, кроме кода возврата процесса (0 - успех).
 #>
 [CmdletBinding()]
 param(
     [Alias('DbPath')]
     [string]$DataPath,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$ScheduledScan
 )
 
 # WinForms требует STA; в Windows PowerShell 5.1 консоль обычно уже STA, но не при запуске из ISE/планировщика.
 # Перезапуск возможен только если известен путь к файлу скрипта ($PSCommandPath пуст при вставке кода в консоль или F8 в ISE).
-if ($PSCommandPath -and [Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
+# -ScheduledScan окна не открывает (и -SelfTest тоже), поэтому STA им не нужен - перезапуск в их случае только
+# замедлил бы плановый запуск лишним процессом powershell.exe.
+if (-not $SelfTest -and -not $ScheduledScan -and $PSCommandPath -and [Threading.Thread]::CurrentThread.GetApartmentState() -ne [Threading.ApartmentState]::STA) {
     $relaunch = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($DataPath) { $relaunch += @('-DataPath', "`"$DataPath`"") }
-    if ($SelfTest) { $relaunch += '-SelfTest' }
     & powershell.exe @relaunch
     exit $LASTEXITCODE
 }
 
 # ПЕРЕМЕННЫЕ ВЕРХНЕГО УРОВНЯ
 #   $SelfTest         - параметр-переключатель: выполнить самопроверку (Invoke-SelfTest) вместо открытия окна.
+#   $ScheduledScan    - параметр-переключатель: выполнить одно плановое сканирование (Invoke-ScheduledScan) и выйти,
+#                       без окна - для запуска из Планировщика заданий Windows.
 #   $DataPath         - параметр скрипта: папка JSON-файлов с данными (если не задана - data рядом со скриптом).
 #   $relaunch         - (в блоке выше) аргументы для повторного запуска powershell.exe в режиме STA.
 #   $script:AppRoot   - папка, где лежит скрипт; от неё строится путь к папке data\. Если путь к файлу скрипта
@@ -199,6 +212,23 @@ function Save-BlockLog {
 function Get-ScanFilePath {
     param([Parameter(Mandatory)][int]$Id)
     Join-Path (Join-Path $script:StoreDir 'scans') ('scan-{0:D6}.json' -f $Id)
+}
+
+# ---- Список компьютеров для плановых сканирований ---------------------------
+# Отдельный от галочек в окне список (data\scheduled-computers.json): его сохраняют один раз на вкладке
+# "Компьютеры" кнопкой "Сохранить список для плановых сканирований", а читает headless-режим -ScheduledScan
+# (см. Invoke-ScheduledScan) при запуске по расписанию, когда окна и галочек нет вообще.
+
+# Save-ScheduledComputerList - сохраняет список имён компьютеров для плановых сканирований. -Names имена.
+function Save-ScheduledComputerList {
+    param([string[]]$Names)
+    Write-JsonFile -Path (Join-Path $script:StoreDir 'scheduled-computers.json') -Data ([ordered]@{ Version = 1; Computers = @($Names) })
+}
+
+# Get-ScheduledComputerList - читает сохранённый список имён компьютеров. Пустой массив, если файла нет.
+function Get-ScheduledComputerList {
+    $doc = Read-JsonFile -Path (Join-Path $script:StoreDir 'scheduled-computers.json')
+    return @(Get-JsonList -Document $doc -Key 'Computers' | ForEach-Object { [string]$_ })
 }
 
 # ---- Сканирования и процессы -------------------------------------------------
@@ -399,7 +429,9 @@ function Add-BlockRecord {
 }
 
 # Get-BlockTable - все блокировки (новые сверху) для вкладки "Блокировки".
-#   Поле Status: "Активна" (Active=1) или "Снята".
+#   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime - результат последней проверки
+#   срабатываний (см. Update-BlockEventInfo); у блокировок, которые ещё не проверяли, EventCount = -1
+#   ("не проверялось" - отличие от 0, то есть "проверили, попыток не было"), LastEventTime пусто.
 function Get-BlockTable {
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('Id', [int])
@@ -411,11 +443,23 @@ function Get-BlockTable {
     [void]$table.Columns.Add('RuleId', [string])
     [void]$table.Columns.Add('Active', [int])
     [void]$table.Columns.Add('Status', [string])
+    [void]$table.Columns.Add('EventCount', [int])
+    [void]$table.Columns.Add('Occurrences', [string])
+    [void]$table.Columns.Add('LastEventTime', [string])
     for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
         $b = $script:Blocks[$i]
         $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
+        $eventCount = -1
+        # .Contains(), а не .ContainsKey(): свежедобавленные за этот сеанс записи - OrderedDictionary ([ordered]@{...}
+        # в Add-BlockRecord), а у неё нет ContainsKey (есть только у Hashtable, в который превращаются записи ПОСЛЕ
+        # перечитывания с диска). .Contains() есть у обоих типов.
+        if ($b.Contains('EventCount')) { $eventCount = [int]$b['EventCount'] }
+        $lastEventTime = ''
+        if ($b.Contains('LastEventTime')) { $lastEventTime = [string]$b['LastEventTime'] }
+        $occurrences = if ($eventCount -lt 0) { 'не проверялось' } else { [string]$eventCount }
         [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
-            [string]$b['Hash'], [string]$b['GpoName'], [string]$b['RuleId'], [int]$b['Active'], $status)
+            [string]$b['Hash'], [string]$b['GpoName'], [string]$b['RuleId'], [int]$b['Active'], $status,
+            $eventCount, $occurrences, $lastEventTime)
     }
     return , $table
 }
@@ -439,6 +483,43 @@ function Disable-BlockRecord {
         if ([int]$b['Id'] -eq $Id) { $b['Active'] = 0 }
     }
     Save-BlockLog
+}
+
+# Update-BlockEventInfo - сохраняет результат проверки срабатываний блокировки (см. Invoke-CheckBlockEvents):
+#   сколько событий отказа SRP найдено и когда было последнее. -Id номер записи; -Count сколько найдено;
+#   -LastTime когда было последнее (пусто, если не найдено ни одного).
+function Update-BlockEventInfo {
+    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][int]$Count, [string]$LastTime)
+    foreach ($b in $script:Blocks) {
+        if ([int]$b['Id'] -eq $Id) {
+            $b['EventCount'] = $Count
+            $b['LastEventTime'] = $LastTime
+        }
+    }
+    Save-BlockLog
+}
+
+# Get-HashComputersEver - на каких компьютерах хэш встречался хоть КОГДА-НИБУДЬ (по всем сканированиям, а не
+#   только по последнему для каждого компьютера, в отличие от Get-HashLocations). Нужна для проверки
+#   срабатываний: опрашивать стоит и те компьютеры, где файл уже не бежит, но раньше встречался - именно там
+#   он мог сработать после блокировки. Читает файлы ВСЕХ сканирований, поэтому при большой истории (сотни
+#   сканирований) может быть не быстрой - как и просмотр "Все сканирования" на вкладке "Процессы".
+#   Локальные: $wanted - хэш в верхнем регистре; $computers - найденные имена (ключи хэш-таблицы, без повторов);
+#   $scan - текущее сканирование; $doc - его файл; $p - текущий процесс в нём.
+function Get-HashComputersEver {
+    param(
+        [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
+        [Parameter(Mandatory)][string]$Hash
+    )
+    $wanted = $Hash.ToUpper()
+    $computers = @{}
+    foreach ($scan in $script:Scans) {
+        $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
+        foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
+            if ([string]$p[$Algorithm] -eq $wanted) { $computers[[string]$p['Computer']] = $true }
+        }
+    }
+    return @($computers.Keys | Sort-Object)
 }
 
 # ===========================================================================
@@ -739,6 +820,52 @@ function Start-BlockApply {
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
         -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
+}
+
+# $script:SrpEventScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере: ищет в журнале событий Windows
+#   следы того, что кто-то пытался запустить ИМЕННО этот заблокированный файл после указанного момента времени.
+#   Software Restriction Policies при отказе в запуске пишет событие в журнал Application от источника "SRP"
+#   с одним из кодов 865 (запрещено по пути), 866 (по хэшу - это как раз наш случай), 867 (по сертификату),
+#   868 (по зоне Интернета) или 882 (запрещено правилом по умолчанию). ВАЖНО: эти коды и имя источника - по
+#   документации Microsoft, НЕ проверены на реальном журнале событий (нет доступа к Windows для проверки);
+#   если на практике они окажутся другими, функция просто ничего не найдёт (поймано в try/catch), а не упадёт
+#   с ошибкой - то есть худший случай - ложный "0 событий", а не сбой.
+#   Чтобы не зависеть от формата и языка текста события (путь и сопровождающие слова могут быть локализованы
+#   по-разному), сам хэш в сообщении ищется так: все символы, кроме шестнадцатеричных цифр, убираются, и
+#   проверяется, встречается ли искомый хэш (32/40/64 символа) как есть внутри получившейся строки - само
+#   шестнадцатеричное значение хэша в событии не переводится ни на одном языке.
+#   -Hash  хэш, который ищем (без разделителей, регистр не важен); -Since  с какого момента искать события
+#   (обычно дата блокировки). Возвращает объекты { Computer, Time, Id, Message } - по одному на найденное событие.
+#   Локальные: $hash - хэш в верхнем регистре; $events - все подходящие по коду и времени события; $e - текущее
+#   событие; $normalized - его текст без ничего, кроме hex-цифр.
+$script:SrpEventScript = {
+    param($Hash, $Since)
+    $hash = ([string]$Hash).ToUpper()
+    try {
+        $events = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'SRP'; Id = 865, 866, 867, 868, 882; StartTime = $Since } -ErrorAction Stop
+    }
+    catch {
+        return      # событий нет, либо журнал/источник недоступен - для вызывающего кода это одно и то же: "ничего не найдено"
+    }
+    foreach ($e in $events) {
+        $normalized = ($e.Message -replace '[^0-9A-Fa-f]', '').ToUpper()
+        if ($normalized.Contains($hash)) {
+            New-Object PSObject -Property @{
+                Computer = $env:COMPUTERNAME
+                Time     = $e.TimeCreated
+                Id       = $e.Id
+                Message  = $e.Message
+            }
+        }
+    }
+}
+
+# Start-SrpEventCheck - в фоне запускает $script:SrpEventScript на указанных компьютерах.
+#   -ComputerName  где искать; -Hash  что искать; -Since  с какого момента. Возвращает задание.
+function Start-SrpEventCheck {
+    param([Parameter(Mandatory)][string[]]$ComputerName, [Parameter(Mandatory)][string]$Hash, [Parameter(Mandatory)][datetime]$Since)
+    Invoke-Command -ComputerName $ComputerName -ScriptBlock $script:SrpEventScript -ArgumentList $Hash, $Since `
+        -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 -AsJob -JobName 'ProcMon-Events'
 }
 
 # Get-JobProgress - прогресс фонового задания: сколько компьютеров уже завершили работу.
@@ -1153,6 +1280,59 @@ if ($SelfTest) {
     exit ([int]$code)
 }
 
+# Invoke-ScheduledScan - headless-сканирование для запуска по расписанию (см. -ScheduledScan): берёт список
+#   компьютеров, сохранённый заранее на вкладке "Компьютеры", опрашивает их синхронно (ждёт завершения, в отличие
+#   от интерактивного режима, где это делает таймер окна) и сохраняет результат как обычное сканирование.
+#   Блокировкой тут и не пахнет - это сознательно: решение заблокировать процесс должен принимать человек, глядя
+#   на таблицу, а не скрипт по расписанию. Возвращает код: 0 - сохранено хотя бы с одного компьютера, 1 - нет
+#   списка компьютеров, ни один не ответил, или сбой запуска. Пишет только в файл журнала (Write-LogFile) и в
+#   консоль - окна нет. Локальные: $names - сохранённый список; $job - фоновое задание сбора (используется и
+#   здесь, просто с синхронным ожиданием через Wait-Job, а не таймером окна); $result - его итог
+#   (Receive-JobResults); $f - сбой одного компьютера; $scan - созданное сканирование.
+function Invoke-ScheduledScan {
+    $names = @(Get-ScheduledComputerList)
+    if ($names.Count -eq 0) {
+        $msg = 'Плановое сканирование: список компьютеров пуст. Сохраните его на вкладке "Компьютеры" (кнопка "Сохранить список для плановых сканирований") и повторите.'
+        Write-LogFile -Message $msg
+        Write-Host $msg -ForegroundColor Yellow
+        return 1
+    }
+    Write-LogFile -Message "=== Плановое сканирование: старт, компьютеров $($names.Count) ==="
+    try {
+        $job = Start-Collection -ComputerName $names
+    }
+    catch {
+        Write-LogFile -Message "Плановое сканирование: не удалось запустить сбор - $($_.Exception.Message)"
+        return 1
+    }
+    $null = Wait-Job -Job $job -Timeout 3600      # запас сверх таймаутов Get-RemoteSessionOption на всякий случай
+    $result = Receive-JobResults -Job $job
+    foreach ($f in $result.Failures) {
+        Write-LogFile -Message ("Плановое сканирование: [{0}] нет данных: {1}" -f $f.Computer, $f.Message)
+    }
+    if ($result.Succeeded -eq 0) {
+        Write-LogFile -Message 'Плановое сканирование: ни один компьютер не ответил.'
+        return 1
+    }
+    $scan = New-Scan -Requested $names.Count
+    Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested $names.Count -Rows $result.Data.ToArray() `
+        -Succeeded $result.Succeeded -Failed $result.Failures.Count
+    Write-LogFile -Message ("=== Плановое сканирование завершено: компьютеров {0} из {1}, записей {2} ===" -f $result.Succeeded, $names.Count, $result.Data.Count)
+    return 0
+}
+
+if ($ScheduledScan) {
+    try {
+        Initialize-Database -Path $DataPath
+    }
+    catch {
+        Write-Host "Не удалось открыть хранилище данных: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    $code = Invoke-ScheduledScan
+    exit ([int]$code)
+}
+
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
@@ -1223,8 +1403,10 @@ function New-Toolbar {
 
 # New-Grid - создаёт пустую таблицу только для чтения и добавляет в неё колонку "№".
 #   Номер вычисляется при отрисовке (RowIndex + 1), поэтому при сортировке и поиске нумерация всегда 1,2,3...
+#   -MultiSelect  разрешить выделять несколько строк (Ctrl/Shift+клик) - нужно для массовой блокировки.
 #   Локальные: $g - таблица; $num - колонка "№"; в обработчике CellFormatting $e - данные отрисовываемой ячейки.
 function New-Grid {
+    param([switch]$MultiSelect)
     $g = New-Object System.Windows.Forms.DataGridView
     $g.Dock = 'Fill'
     $g.ReadOnly = $true
@@ -1232,7 +1414,7 @@ function New-Grid {
     $g.AllowUserToDeleteRows = $false
     $g.AllowUserToResizeRows = $false
     $g.SelectionMode = 'FullRowSelect'
-    $g.MultiSelect = $false
+    $g.MultiSelect = [bool]$MultiSelect
     $g.AutoGenerateColumns = $false
     $g.RowHeadersVisible = $false
     $g.BackgroundColor = [System.Drawing.Color]::White
@@ -1355,6 +1537,9 @@ function Set-Status {
 #   $script:SearchBaseBox - поле DN подразделения (OU) для поиска в AD (пусто - весь домен);
 #   $script:ManualBox + $btnAddManual - поле и кнопка ручного добавления компьютера;
 #   $btnScan - "Собрать процессы"; $btnStop - "Остановить" сбор (активна только во время сбора);
+#   $btnSaveSchedule - сохраняет отмеченные компьютеры как список для плановых сканирований
+#   (см. -ScheduledScan в справке скрипта и README - запуск по расписанию без окна);
+#   $btnLoadSchedule - добавляет в список и отмечает компьютеры из уже сохранённого расписания (проверить/поправить);
 #   $script:CompList - список компьютеров с флажками (имя и ОС); отмеченные будут опрошены.
 $compBar = New-Toolbar
 $btnLoadAd = New-Button 'Загрузить из AD' 140
@@ -1366,8 +1551,11 @@ $btnAddManual = New-Button 'Добавить' 80
 $btnScan = New-Button 'Собрать процессы' 150
 $btnStop = New-Button 'Остановить' 100
 $btnStop.Enabled = $false
+$btnSaveSchedule = New-Button 'Сохранить список для плановых сканирований' 260
+$btnLoadSchedule = New-Button 'Загрузить сохранённый список' 190
 $compBar.Controls.AddRange(@($btnLoadAd, (New-Label 'OU (DN, необязательно):'), $script:SearchBaseBox,
-        $btnAll, $btnNone, (New-Label 'Добавить вручную:'), $script:ManualBox, $btnAddManual, $btnScan, $btnStop))
+        $btnAll, $btnNone, (New-Label 'Добавить вручную:'), $script:ManualBox, $btnAddManual, $btnScan, $btnStop,
+        $btnSaveSchedule, $btnLoadSchedule))
 
 $script:CompList = New-Object System.Windows.Forms.ListView
 $script:CompList.Dock = 'Fill'
@@ -1385,7 +1573,9 @@ $tabComputers.Controls.Add($compBar)
 #   $procBar - панель инструментов; $script:ScanCombo - выбор сканирования ("Все сканирования" или конкретное);
 #   $script:AlgoCombo - какой хэш показывать и использовать для блокировки (MD5/SHA1/SHA256);
 #   $script:FilterBox - поиск по имени, хэшу, компьютеру, пользователю и пути; $btnRefresh - "Обновить" (перечитать данные);
-#   $btnBlock - "Заблокировать по хэшу..."; $script:ProcGrid - таблица процессов (№, время запуска процесса, Имя, Хэш, Компьютер, Пользователь, Путь).
+#   $btnBlock - "Заблокировать по хэшу..." (выделено несколько строк Ctrl/Shift+клик - массовая блокировка,
+#   Invoke-BlockSelectedBatch; одна - как раньше, Invoke-BlockSelected); $script:ProcGrid - таблица процессов
+#   (№, время запуска процесса, Имя, Хэш, Компьютер, Пользователь, Путь), поддерживает выделение нескольких строк.
 $procBar = New-Toolbar
 $script:ScanCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 260; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
 $script:AlgoCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 80; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
@@ -1397,7 +1587,7 @@ $btnBlock = New-Button 'Заблокировать по хэшу...' 190
 $procBar.Controls.AddRange(@((New-Label 'Сканирование:'), $script:ScanCombo, (New-Label 'Хэш:'), $script:AlgoCombo,
         (New-Label 'Поиск:'), $script:FilterBox, $btnRefresh, $btnBlock))
 
-$script:ProcGrid = New-Grid
+$script:ProcGrid = New-Grid -MultiSelect
 Add-GridColumn $script:ProcGrid 'Запуск процесса' 'StartTime' 150
 Add-GridColumn $script:ProcGrid 'Имя' 'Name' 180
 Add-GridColumn $script:ProcGrid 'Хэш' 'Hash' 330 -Mono
@@ -1418,21 +1608,26 @@ $tabProcesses.Controls.Add($procBar)
 #   На известных компьютерах (где файл встречался в последнем сканировании) блокировка автоматически: обновляет
 #   политики (gpupdate), завершает уже запущенные экземпляры файла и показывает каждому затронутому пользователю
 #   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков.
-#   $btnUnblock - "Снять блокировку"; $script:BlockGrid - таблица всех блокировок.
+#   $btnUnblock - "Снять блокировку"; $btnCheckEvents - "Проверить срабатывания" (ищет в журнале событий Windows
+#   попытки запуска заблокированного файла после даты блокировки - см. Invoke-CheckBlockEvents, там же оговорка
+#   про недоказанность кодов событий); $script:BlockGrid - таблица всех блокировок.
 $script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
 $blockBar = New-Toolbar
 $script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
 $script:LinkCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 340; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
 $btnLoadOUs = New-Button 'Загрузить OU из AD' 160
 $btnUnblock = New-Button 'Снять блокировку' 140
+$btnCheckEvents = New-Button 'Проверить срабатывания' 190
 $blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, можно выбрать из списка):'), $script:LinkCombo,
-        $btnLoadOUs, $btnUnblock))
+        $btnLoadOUs, $btnUnblock, $btnCheckEvents))
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
 Add-GridColumn $script:BlockGrid 'Имя' 'Name' 160
 Add-GridColumn $script:BlockGrid 'Алгоритм' 'Algorithm' 70
 Add-GridColumn $script:BlockGrid 'Хэш' 'Hash' 330 -Mono
+Add-GridColumn $script:BlockGrid 'Срабатываний' 'Occurrences' 100
+Add-GridColumn $script:BlockGrid 'Последнее срабатывание' 'LastEventTime' 150
 Add-GridColumn $script:BlockGrid 'Статус' 'Status' 80
 Add-GridColumn $script:BlockGrid 'GPO' 'GpoName' 200 -Fill
 
@@ -1910,6 +2105,155 @@ function Complete-BlockApply {
     Set-Status ("Применение завершено: успешно {0}, ошибок {1}" -f $result.Succeeded, $result.Failures.Count)
 }
 
+# Invoke-BlockSelectedBatch - обработчик "Заблокировать по хэшу..." при выделении НЕСКОЛЬКИХ строк: для каждого
+#   уникального хэша среди них (один и тот же файл, выбранный на разных компьютерах, - это одна блокировка, не
+#   несколько) выполняет те же шаги, что Invoke-BlockSelected для одной строки, но с ОДНИМ общим подтверждением
+#   и ОДНИМ вопросом про завершение сеанса на весь пакет, а не по разу на каждый файл. GPO и привязка общие для
+#   всех (поля на вкладке "Блокировки" одни на всё приложение), поэтому предупреждение про непривязанную GPO
+#   тоже показывается один раз. Уже заблокированные, с некорректным хэшем или защищённым путём файлы молча
+#   пропускаются (перечисляются в сообщении, почему), остальные блокируются; ошибка на одном хэше не прерывает
+#   обработку остальных - каждая пишется в журнал отдельно. Применение (gpupdate/завершение/уведомление)
+#   запускается отдельным фоновым заданием на каждый файл (переиспользует Start-BlockApply без изменений), все
+#   они просто стартуют одним нажатием кнопки, а не создают одно сложное общее задание.
+#   -Rows  выбранные строки таблицы процессов (DataRow, как у Invoke-BlockSelected).
+#   Локальные: $algorithm - алгоритм хэша (общий, из $script:AlgoCombo); $gpo/$linkTarget - общие GPO и привязка;
+#   $seen - хэши, уже учтённые при разборе (защита от дублей); $toBlock - файлы к блокировке (Name/Hash/Path/Size);
+#   $skipped - пропущенные файлы с причиной; $row/$hash/$name/$path/$size - разбор текущей строки;
+#   $linkSummary/$hasEnabledLink/$willBeUnlinked - то же, что в Invoke-BlockSelected, проверяется один раз;
+#   $message - текст общего подтверждения; $anyLocations - есть ли смысл спрашивать про завершение сеанса;
+#   $logoffSessions - общий ответ про завершение сеанса; $blocked - сколько файлов реально заблокировано;
+#   $item - текущий файл из $toBlock; $ruleId - GUID созданного правила; $locations/$map/$loc/$key/$notifyText/$job -
+#   то же самое, что в Invoke-BlockSelected, но внутри цикла по каждому файлу из $toBlock.
+function Invoke-BlockSelectedBatch {
+    param([Parameter(Mandatory)][object[]]$Rows)
+
+    $algorithm = [string]$script:AlgoCombo.SelectedItem
+    $gpo = $script:GpoBox.Text.Trim()
+    $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
+
+    if (-not $gpo) {
+        Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
+        return
+    }
+    if (-not (Test-GroupPolicyModule)) {
+        Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy. Установите на этом компьютере компонент "Group Policy Management" (RSAT).'
+        return
+    }
+
+    $seen = @{}
+    $toBlock = New-Object System.Collections.ArrayList
+    $skipped = New-Object System.Collections.ArrayList
+    foreach ($row in $Rows) {
+        $hash = [string]$row['Hash']
+        $name = [string]$row['Name']
+        $path = [string]$row['Path']
+        if ($seen.ContainsKey($hash)) { continue }      # тот же файл уже встречался среди выбранных строк
+        $seen[$hash] = $true
+
+        if (-not (Test-HashValue -Algorithm $algorithm -Hash $hash)) {
+            [void]$skipped.Add("$name - нет корректного $algorithm-хэша")
+            continue
+        }
+        if (Test-ProtectedPath -Path $path) {
+            [void]$skipped.Add("$name - файл в каталоге Windows, блокировка запрещена")
+            continue
+        }
+        if (Get-ActiveBlock -Algorithm $algorithm -Hash $hash) {
+            [void]$skipped.Add("$name - блокировка уже активна")
+            continue
+        }
+        $size = 0L
+        if ($row['Size'] -isnot [DBNull]) { $size = [long]$row['Size'] }
+        [void]$toBlock.Add([pscustomobject]@{ Name = $name; Hash = $hash; Path = $path; Size = $size })
+    }
+
+    if ($toBlock.Count -eq 0) {
+        Show-Message -Icon Warning -Text ("Блокировать нечего:`n`n" + ($skipped -join "`n"))
+        return
+    }
+
+    $linkSummary = Get-GpoLinkSummary -GpoName $gpo
+    $hasEnabledLink = $linkSummary -and $linkSummary.Enabled -gt 0
+    $willBeUnlinked = -not $hasEnabledLink -and -not $linkTarget
+    if ($willBeUnlinked) {
+        Show-Message -Title 'GPO не привязана' -Icon Warning -Text (
+            "ВНИМАНИЕ: у GPO `"$gpo`" сейчас нет ни одной включённой привязки (Link) к OU или домену, и поле " +
+            "`"Привязать к`" не заполнено.`n`n" +
+            "Без привязки ни одно из следующих правил НЕ ПОДЕЙСТВУЕТ ни на одном компьютере, сколько бы раз ни " +
+            "выполнялся gpupdate - клиент просто не станет обрабатывать эту GPO.`n`n" +
+            "Чтобы правила заработали: либо укажите DN нужного OU/домена в поле `"Привязать к`" и заблокируйте " +
+            "ещё раз, либо привяжите GPO вручную в GPMC (ПКМ по OU -> Link an Existing GPO)."
+        )
+    }
+
+    $message = "Заблокировать запуск $($toBlock.Count) файлов по хэшу?`n`n" +
+        (($toBlock | ForEach-Object { "  - $($_.Name)" }) -join "`n") + "`n`nGPO: $gpo"
+    if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
+    else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
+    if ($skipped.Count -gt 0) { $message += "`n`nПропущено ($($skipped.Count)):`n" + ($skipped -join "`n") }
+    $message += "`n`nНа компьютерах, где эти файлы встречались в последнем сканировании, сразу после добавления " +
+        "правил: обновятся политики (gpupdate), будут закрыты уже запущенные экземпляры, а их пользователям " +
+        "будет показано уведомление."
+    if (-not (Confirm-Action -Text $message -Title "Блокировка по хэшу ($($toBlock.Count) файлов)")) { return }
+
+    $anyLocations = $false
+    foreach ($item in $toBlock) {
+        if ((Get-HashLocations -Algorithm $algorithm -Hash $item.Hash).Rows.Count -gt 0) { $anyLocations = $true; break }
+    }
+    $logoffSessions = $false
+    if ($anyLocations) {
+        $logoffSessions = Confirm-Action -Title 'Завершение сеанса пользователя' -Text (
+            "Процессы будут закрыты на найденных компьютерах. Нужно ли дополнительно принудительно завершить " +
+            "сеанс пользователя(ей), у которых они были открыты (в целях безопасности и предотвращения " +
+            "нарушений)?`n`nЭто закроет ВСЕ открытые у них программы на этом компьютере, а не только " +
+            "заблокированные файлы, и они будут немедленно отключены от сеанса. Ответ один на весь пакет."
+        )
+    }
+
+    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    $blocked = 0
+    try {
+        foreach ($item in $toBlock) {
+            try {
+                $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LinkTarget $linkTarget
+                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -GpoName $gpo -RuleId $ruleId
+                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash)), GPO '$gpo', правило $ruleId"
+                $blocked++
+            }
+            catch {
+                Write-Log "Ошибка блокировки $($item.Name): $($_.Exception.Message)"
+                continue
+            }
+
+            $locations = Get-HashLocations -Algorithm $algorithm -Hash $item.Hash
+            if ($locations.Rows.Count -eq 0) { continue }
+            $map = @{}
+            foreach ($loc in $locations.Rows) {
+                $key = ([string]$loc.Computer).ToUpper()
+                if (-not $map.ContainsKey($key)) { $map[$key] = @() }
+                $map[$key] += [string]$loc.Path
+            }
+            $notifyText = $script:NotifyTemplate -f $item.Name
+            try {
+                $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions
+                Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
+            }
+            catch {
+                Write-Log "Не удалось запустить применение для $($item.Name): $($_.Exception.Message)"
+            }
+        }
+    }
+    finally {
+        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+    if ($willBeUnlinked -and $blocked -gt 0) {
+        Write-Log "ВНИМАНИЕ: GPO '$gpo' не привязана ни к одному OU/домену - $blocked блокировок НЕ действуют, пока вы её не привяжете."
+    }
+    Update-BlockGrid
+    Write-Log "Массовая блокировка завершена: добавлено $blocked из $($toBlock.Count)."
+    Set-Status "Массовая блокировка: добавлено $blocked из $($toBlock.Count)."
+}
+
 # Invoke-UnblockSelected - обработчик "Снять блокировку": после подтверждения удаляет правило из GPO и
 #   помечает запись в журнале снятой. $row - выбранная блокировка; $text - текст подтверждения.
 function Invoke-UnblockSelected {
@@ -1946,6 +2290,76 @@ function Invoke-UnblockSelected {
     }
 }
 
+# Invoke-CheckBlockEvents - обработчик "Проверить срабатывания": на всех компьютерах, где хэш выбранной
+#   блокировки встречался хоть когда-нибудь (Get-HashComputersEver, не только в последнем сканировании),
+#   ищет в журнале событий Windows следы попыток его запустить после даты блокировки (Start-SrpEventCheck).
+#   Результат - в Complete-CheckBlockEvents, когда фоновое задание завершится.
+#   Важная оговорка (см. комментарий у $script:SrpEventScript): код события и имя источника - по документации,
+#   не проверены на реальном журнале; если они other на вашей версии Windows, проверка тихо покажет 0 событий.
+#   Локальные: $row - выбранная блокировка; $algorithm/$hash/$id - её данные; $since - дата блокировки
+#   (BlockDate, строка "гггг-мм-дд чч:мм:сс", парсится как обычная дата); $computers - где хэш видели;
+#   $job - фоновое задание. OnDone-обработчик собран через .GetNewClosure(), иначе $id потеряется к моменту
+#   вызова (таймер окна вызывает его из совсем другой области видимости).
+function Invoke-CheckBlockEvents {
+    if (-not $script:BlockGrid.CurrentRow -or -not $script:BlockGrid.CurrentRow.DataBoundItem) {
+        Show-Message -Text 'Выберите блокировку в таблице.' -Icon Warning
+        return
+    }
+    $row = $script:BlockGrid.CurrentRow.DataBoundItem.Row
+    $algorithm = [string]$row['Algorithm']
+    $hash = [string]$row['Hash']
+    $id = [int]$row['Id']
+    $since = [datetime]$row['BlockDate']
+
+    $computers = @(Get-HashComputersEver -Algorithm $algorithm -Hash $hash)
+    if ($computers.Count -eq 0) {
+        Show-Message -Text 'Компьютеры, где встречался этот файл, неизвестны (нет данных сканирования) - проверять нечего.'
+        return
+    }
+    Write-Log "Проверка срабатываний блокировки '$($row['Name'])' на $($computers.Count) компьютерах (с $($row['BlockDate']))..."
+    Set-Status "Проверка срабатываний на $($computers.Count) компьютерах..."
+    try {
+        $job = Start-SrpEventCheck -ComputerName $computers -Hash $hash -Since $since
+        Register-UiJob -Job $job -OnDone { param($j) Complete-CheckBlockEvents -Job $j -BlockId $id }.GetNewClosure()
+    }
+    catch {
+        Write-Log "Не удалось запустить проверку срабатываний: $($_.Exception.Message)"
+    }
+}
+
+# Complete-CheckBlockEvents - вызывается по завершении проверки срабатываний: считает общее число найденных
+#   событий и самое позднее из них, сохраняет в журнал блокировок (Update-BlockEventInfo) и обновляет таблицу.
+#   -Job завершённое задание; -BlockId номер блокировки, для которой проверяли.
+#   Локальные: $result - итог (Receive-JobResults); $events - найденные события (result.Data); $last - самое
+#   позднее время среди них; $e - текущее событие; $byComputer - для журнала, сколько событий на каком ПК.
+function Complete-CheckBlockEvents {
+    param($Job, [int]$BlockId)
+    $result = Receive-JobResults -Job $Job
+    $events = @($result.Data)
+    $last = $null
+    $byComputer = @{}
+    foreach ($e in $events) {
+        if (-not $last -or $e.Time -gt $last) { $last = $e.Time }
+        $key = [string]$e.Computer
+        if (-not $byComputer.ContainsKey($key)) { $byComputer[$key] = 0 }
+        $byComputer[$key] = $byComputer[$key] + 1
+    }
+    $lastText = if ($last) { $last.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
+    Update-BlockEventInfo -Id $BlockId -Count $events.Count -LastTime $lastText
+    Update-BlockGrid
+    if ($events.Count -gt 0) {
+        $details = ($byComputer.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ', '
+        Write-Log "Проверка срабатываний: найдено событий $($events.Count) ($details), последнее - $lastText"
+    }
+    else {
+        Write-Log 'Проверка срабатываний: попыток запуска не найдено (или они не распознаны - см. оговорку про коды событий в README).'
+    }
+    foreach ($f in $result.Failures) {
+        Write-Log ("[{0}] не удалось проверить: {1}" -f $f.Computer, $f.Message)
+    }
+    Set-Status "Проверка срабатываний завершена: найдено событий $($events.Count)"
+}
+
 # ---------------------------------------------------------------------------
 # Обработчики событий
 # ---------------------------------------------------------------------------
@@ -1969,13 +2383,57 @@ $btnStop.Add_Click({
             Write-Log 'Сбор остановлен пользователем (будут сохранены уже полученные данные).'
         }
     })
+$btnSaveSchedule.Add_Click({
+        $names = @($script:CompList.CheckedItems | ForEach-Object { $_.Text })
+        if ($names.Count -eq 0) {
+            Show-Message -Text 'Отметьте компьютеры, которые должны опрашиваться по расписанию.' -Icon Warning
+            return
+        }
+        try {
+            Save-ScheduledComputerList -Names $names
+            Write-Log "Список для плановых сканирований сохранён: компьютеров $($names.Count)"
+            Show-Message -Text (
+                "Сохранено компьютеров: $($names.Count).`n`n" +
+                "Чтобы сканирование запускалось по расписанию без открытия окна, добавьте задание в Планировщик заданий Windows, запускающее:`n`n" +
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ScheduledScan`n`n" +
+                "Подробности и важное про учётную запись для задания - в README.md."
+            )
+        }
+        catch {
+            Write-Log "Не удалось сохранить список для плановых сканирований: $($_.Exception.Message)"
+            Show-Message -Text "Не удалось сохранить список:`n$($_.Exception.Message)" -Icon Error
+        }
+    })
+$btnLoadSchedule.Add_Click({
+        $names = @(Get-ScheduledComputerList)
+        if ($names.Count -eq 0) {
+            Show-Message -Text 'Сохранённый список для плановых сканирований пуст.'
+            return
+        }
+        $script:CompList.BeginUpdate()
+        try {
+            foreach ($n in $names) {
+                Add-ComputerItem -HostName $n -OS '(из списка плановых сканирований)'
+                foreach ($item in $script:CompList.Items) { if ($item.Text -ieq $n) { $item.Checked = $true } }
+            }
+        }
+        finally {
+            $script:CompList.EndUpdate()
+        }
+        Write-Log "Загружен сохранённый список плановых сканирований: компьютеров $($names.Count)"
+    })
 $script:ScanCombo.Add_SelectedIndexChanged({ Update-ProcessGrid })
 $script:AlgoCombo.Add_SelectedIndexChanged({ Update-ProcessGrid })
 $script:FilterBox.Add_TextChanged({ Update-ProcessFilter })
 $btnRefresh.Add_Click({ Update-ScanList })
-$btnBlock.Add_Click({ Invoke-BlockSelected })
+$btnBlock.Add_Click({
+        $rows = @($script:ProcGrid.SelectedRows | ForEach-Object { $_.DataBoundItem.Row })
+        if ($rows.Count -gt 1) { Invoke-BlockSelectedBatch -Rows $rows }
+        else { Invoke-BlockSelected }
+    })
 $btnLoadOUs.Add_Click({ Import-AdOUs })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
+$btnCheckEvents.Add_Click({ Invoke-CheckBlockEvents })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
         else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
