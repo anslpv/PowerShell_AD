@@ -827,6 +827,18 @@ $script:ApplyBlockScript = {
         21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
+        # По умолчанию PowerShell перекодирует вывод консольных программ по значению $OutputEncoding, которое в
+        # сеансе без настоящей консоли (а именно так выполняется этот скрипт - через Invoke-Command/WinRM) может
+        # не совпадать с реальной кодовой страницей, в которой gpupdate.exe печатает текст (OEM, не ANSI/UTF-8) -
+        # из-за этого кириллица в выводе превращается в "кракозябры". Берём настоящую OEM-кодовую страницу этого
+        # компьютера из реестра (как это делает сам chcp.com) и используем именно её; если почему-либо не
+        # получилось - молча остаёмся на прежнем поведении, не ломая остальную часть применения блокировки.
+        try {
+            $oemCp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP
+            $OutputEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
+        }
+        catch { }
+
         $gpOut = & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) {
             $res.GpUpdate = 'OK'
@@ -1097,17 +1109,25 @@ function Set-GpoUserFiltering {
 # Initialize-SrpGpo - готовит GPO к хранению правил: создаёт её, если нет; записывает базовые параметры
 #   SRP (если их ещё нет - существующие не перезаписываются); при необходимости привязывает к OU/домену;
 #   если задан -PrincipalSam - ограничивает действие GPO только этим пользователем/группой (Set-GpoUserFiltering).
-#   -GpoName  имя GPO; -LinkTarget  DN контейнера для привязки (пусто - не привязывать);
+#   -GpoName  имя GPO; -LinkTarget  DN контейнера для привязки (пусто - не привязывать); -Scope  'Computer'
+#   (по умолчанию) или 'User' - базовые настройки SRP пишутся ТОЛЬКО в этот раздел (Computer или User
+#   Configuration), а не в оба сразу: у каждой GPO, которую создаёт это приложение, только ОДНО назначение
+#   (компьютерная блокировка - свои GPO с базовым именем; блокировка по пользователю/группе - свои отдельные
+#   GPO с суффиксом, см. Resolve-BlockTarget), поэтому второй раздел такой GPO никогда не использовался бы, и
+#   писать туда пустую, бесполезную конфигурацию SRP (DefaultLevel/PolicyScope и т. п. без единого правила)
+#   незачем - раньше это делалось, пока не выяснилось, что GPMC начинает отказываться строить отчёт "Параметры"
+#   для такой GPO ("Ссылка на объект не указывает на экземпляр объекта").
 #   -PrincipalSam/-PrincipalType  см. Set-GpoUserFiltering (пусто - фильтрация не трогается, GPO действует на
 #   всех, как обычная компьютерная блокировка). Возвращает GPO.
-#   Локальные: $gpo - объект GPO; $hasBase - есть ли в GPO базовые настройки SRP;
-#   $base - раздел реестра; $linked - уже привязана ли GPO к контейнеру.
+#   Локальные: $gpo - объект GPO; $base - раздел реестра (Computer или User, по -Scope); $hasBase - есть ли в
+#   GPO базовые настройки SRP в этом разделе; $linked - уже привязана ли GPO к контейнеру.
 #   Базовые значения: DefaultLevel=262144 ("Неограниченный": всё, что не запрещено, работает), TransparentEnabled=1,
 #   PolicyScope=0 (все пользователи), AuthenticodeEnabled=0, ExecutableTypes (список расширений).
 function Initialize-SrpGpo {
     param(
         [Parameter(Mandatory)][string]$GpoName,
         [string]$LinkTarget,
+        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
         [string]$PrincipalSam,
         # Без ValidateSet: параметр необязательный, и при вызове без -PrincipalSam сюда часто передают пустую
         # строку явно (например, Add-SrpHashBlock всегда передаёт своё $PrincipalType дальше) - ValidateSet
@@ -1123,24 +1143,21 @@ function Initialize-SrpGpo {
         $gpo = New-GPO -Name $GpoName -Comment 'Блокировка процессов по хэшу (создано ProcessMonitor)' -ErrorAction Stop
     }
 
-    # Базовые настройки SRP пишутся и в Computer, и в User Configuration одной и той же GPO - раздел, в который
-    # реально попадёт хэш-правило (см. Add-SrpHashBlock), определяется позже, отдельно для каждого правила.
-    foreach ($base in @($script:SrpBase, $script:SrpBaseUser)) {
-        $hasBase = $true
-        try {
-            [void](Get-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -ErrorAction Stop)
-        }
-        catch {
-            $hasBase = $false
-        }
-        if (-not $hasBase) {
-            # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
-            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
-            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
-            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
-            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
-            [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
-        }
+    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
+    $hasBase = $true
+    try {
+        [void](Get-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -ErrorAction Stop)
+    }
+    catch {
+        $hasBase = $false
+    }
+    if (-not $hasBase) {
+        # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
+        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
     }
 
     if ($LinkTarget) {
@@ -1182,7 +1199,7 @@ function Add-SrpHashBlock {
     if (-not (Test-HashValue -Algorithm $Algorithm -Hash $Hash)) {
         throw "Некорректный $Algorithm-хэш: '$Hash'."
     }
-    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType)
+    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget -Scope $Scope -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType)
 
     $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
     $ruleId = [Guid]::NewGuid().ToString('B')
