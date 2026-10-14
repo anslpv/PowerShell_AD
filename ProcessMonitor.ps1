@@ -798,6 +798,10 @@ $script:CollectScript = {
 #   (завершился сам, или путь в данных сканирования устарел). Уведомление и завершение сеанса выполняются, только
 #   если процесс реально завершён (TRUE Kill), и только один раз на пользователя/сеанс, даже если он держал
 #   открытыми несколько копий файла.
+#   $SkipGpUpdate - не вызывать gpupdate.exe вообще (GpUpdate в результате будет "пропущено"). Нужен для
+#   Invoke-BlockSweep - повторной проверки уже заблокированных файлов после каждого сканирования: она не зависит
+#   от групповой политики (в т. ч. не требует, чтобы GPO была привязана и вообще применялась - см. обсуждение
+#   про ошибку "LocalGPO") и не должна тратить время на обновление политик при каждом сканировании.
 #   Локальные: $res - возвращаемый результат; $paths - пути, по которым ищем запущенные экземпляры;
 #   $reasonMap - код возврата Terminate() -> текст причины; $notified - кому уведомление уже отправлено;
 #   $loggedOff - какие сеансы (SessionId) уже завершены в этом запуске (защита от дублей, если у пользователя
@@ -805,7 +809,7 @@ $script:CollectScript = {
 #   запущенного экземпляра (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки
 #   им может быть уже другой пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
-    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false, $RestrictOwnerSam = '')
+    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false, $RestrictOwnerSam = '', $SkipGpUpdate = $false)
     $res = New-Object PSObject -Property @{
         Computer           = $env:COMPUTERNAME
         GpUpdate           = ''
@@ -827,46 +831,51 @@ $script:ApplyBlockScript = {
         21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
-        # Предыдущая попытка (через $OutputEncoding перед обычным "& gpupdate.exe ... | Out-String") не помогла -
-        # $OutputEncoding управляет тем, в какой кодировке PowerShell ОТПРАВЛЯЕТ текст НА ВХОД внешней программе,
-        # а не тем, как он РАСШИФРОВЫВАЕТ её вывод, так что к этой задаче он вообще не относился. Вместо того
-        # чтобы полагаться на то, как PowerShell сам решает читать вывод консольной программы (через [Console]::
-        # OutputEncoding, которого в сеансе без настоящей консоли - а именно так выполняется этот скрипт, через
-        # Invoke-Command/WinRM - может не быть вовсе), запускаем gpupdate.exe напрямую через .NET
-        # System.Diagnostics.Process и явно задаём кодировку чтения его stdout/stderr сами - это не зависит от
-        # наличия консоли и от того, что в неё "думает" PowerShell. Кодировка - настоящая OEM-кодовая страница
-        # этого компьютера (та, в которой консольные программы печатают текст), берётся из реестра, как это
-        # делает сам chcp.com; если почему-либо не получилось определить - используется кодировка по умолчанию
-        # (тогда кириллица может остаться нечитаемой, но код возврата и остальная часть применения блокировки
-        # всё равно отработают).
-        $oemEncoding = [System.Text.Encoding]::Default
-        try {
-            $oemCp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP
-            $oemEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
-        }
-        catch { }
-
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = "$env:windir\System32\gpupdate.exe"
-        $psi.Arguments = '/target:computer /force'
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.StandardOutputEncoding = $oemEncoding
-        $psi.StandardErrorEncoding = $oemEncoding
-        $gpProc = [System.Diagnostics.Process]::Start($psi)
-        $gpStdOut = $gpProc.StandardOutput.ReadToEnd()
-        $gpStdErr = $gpProc.StandardError.ReadToEnd()
-        $gpProc.WaitForExit()
-        $gpExitCode = $gpProc.ExitCode
-
-        if ($gpExitCode -eq 0) {
-            $res.GpUpdate = 'OK'
+        if ($SkipGpUpdate) {
+            $res.GpUpdate = 'пропущено'
         }
         else {
-            $res.GpUpdate = 'код ' + $gpExitCode
-            # Выводим реальный текст gpupdate.exe, чтобы ненулевой код было видно сразу в журнале, без похода за gpresult /h на сам компьютер.
-            $res.GpUpdateOutput = (($gpStdOut + $gpStdErr) -replace '[\r\n]+', ' ').Trim()
+            # Предыдущая попытка (через $OutputEncoding перед обычным "& gpupdate.exe ... | Out-String") не помогла -
+            # $OutputEncoding управляет тем, в какой кодировке PowerShell ОТПРАВЛЯЕТ текст НА ВХОД внешней программе,
+            # а не тем, как он РАСШИФРОВЫВАЕТ её вывод, так что к этой задаче он вообще не относился. Вместо того
+            # чтобы полагаться на то, как PowerShell сам решает читать вывод консольной программы (через [Console]::
+            # OutputEncoding, которого в сеансе без настоящей консоли - а именно так выполняется этот скрипт, через
+            # Invoke-Command/WinRM - может не быть вовсе), запускаем gpupdate.exe напрямую через .NET
+            # System.Diagnostics.Process и явно задаём кодировку чтения его stdout/stderr сами - это не зависит от
+            # наличия консоли и от того, что в неё "думает" PowerShell. Кодировка - настоящая OEM-кодовая страница
+            # этого компьютера (та, в которой консольные программы печатают текст), берётся из реестра, как это
+            # делает сам chcp.com; если почему-либо не получилось определить - используется кодировка по умолчанию
+            # (тогда кириллица может остаться нечитаемой, но код возврата и остальная часть применения блокировки
+            # всё равно отработают).
+            $oemEncoding = [System.Text.Encoding]::Default
+            try {
+                $oemCp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP
+                $oemEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
+            }
+            catch { }
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "$env:windir\System32\gpupdate.exe"
+            $psi.Arguments = '/target:computer /force'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = $oemEncoding
+            $psi.StandardErrorEncoding = $oemEncoding
+            $gpProc = [System.Diagnostics.Process]::Start($psi)
+            $gpStdOut = $gpProc.StandardOutput.ReadToEnd()
+            $gpStdErr = $gpProc.StandardError.ReadToEnd()
+            $gpProc.WaitForExit()
+            $gpExitCode = $gpProc.ExitCode
+
+            if ($gpExitCode -eq 0) {
+                $res.GpUpdate = 'OK'
+            }
+            else {
+                $res.GpUpdate = 'код ' + $gpExitCode
+                # Выводим реальный текст gpupdate.exe, чтобы ненулевой код было видно сразу в журнале, без похода за gpresult /h на сам компьютер.
+                $res.GpUpdateOutput = (($gpStdOut + $gpStdErr) -replace '[\r\n]+', ' ').Trim()
+            }
         }
 
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
@@ -950,9 +959,9 @@ function Start-Collection {
 #   -NotifyText  текст уведомления пользователю при завершении его процесса;
 #   -LogoffSessions  завершать ли принудительно сеанс пользователя после завершения его процесса. Возвращает задание.
 function Start-BlockApply {
-    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false, [string]$RestrictOwnerSam = '')
+    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false, [string]$RestrictOwnerSam = '', [bool]$SkipGpUpdate = $false)
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
-        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions, $RestrictOwnerSam -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions, $RestrictOwnerSam, $SkipGpUpdate -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
 }
 
@@ -1062,6 +1071,12 @@ $script:SrpBaseUser = 'HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdenti
 $script:SrpHashAlg = @{ MD5 = 32771; SHA1 = 32772; SHA256 = 32780 }
 # $script:HashLength - сколько шестнадцатеричных символов в хэше каждого алгоритма (для проверки ввода).
 $script:HashLength = @{ MD5 = 32; SHA1 = 40; SHA256 = 64 }
+
+# $script:NotifyTemplate - текст уведомления, которое видит пользователь при закрытии заблокированного файла
+#   (имя файла подставляется вместо {0}). Объявлено здесь, а не в UI-блоке ниже, потому что используется и из
+#   Invoke-BlockSweep (см. ниже), которая должна работать и в режиме -ScheduledScan - там код до UI-блока
+#   вообще не доходит (скрипт завершается раньше, см. "if ($ScheduledScan) {...; exit}").
+$script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
 
 # $script:SrpExecutableTypes - расширения файлов, которые SRP проверяет (записываются в GPO один раз вместе с базовыми настройками).
 $script:SrpExecutableTypes = @(
@@ -1518,7 +1533,81 @@ function Invoke-ScheduledScan {
     Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested $names.Count -Rows $result.Data.ToArray() `
         -Succeeded $result.Succeeded -Failed $result.Failures.Count
     Write-LogFile -Message ("=== Плановое сканирование завершено: компьютеров {0} из {1}, записей {2} ===" -f $result.Succeeded, $names.Count, $result.Data.Count)
+    Invoke-BlockSweep -Rows $result.Data.ToArray()
     return 0
+}
+
+# Invoke-BlockSweep - "невод": после КАЖДОГО сканирования (ручного или планового) сверяет свежесобранные строки
+#   с активными блокировками (Get-BlockTable) и для каждого совпадения сразу закрывает найденные запущенные
+#   экземпляры файла - НЕ дожидаясь и вообще НЕ полагаясь на GPO/SRP (-SkipGpUpdate у Start-BlockApply):
+#   gpupdate здесь даже не вызывается. Это сознательный компромисс взамен проблем с групповой политикой на
+#   конкретном домене (см. обсуждение про "LocalGPO" в журнале) - ценой окна между запуском заблокированного
+#   файла и следующим сканированием (а не мгновенно, как настоящий SRP), зато вообще не зависит от того,
+#   работает ли GPO. Принудительное завершение сеанса сюда сознательно не входит (-LogoffSessions $false) - это
+#   сильное действие, оставлено только для явного запроса администратора при самой блокировке
+#   (Invoke-BlockSelected/-Batch), не для автоматической фоновой проверки без присмотра.
+#   -Rows  строки свежесобранного сканирования - ровно то же, что передаётся в Save-Processes (с полями
+#   Computer/Name/Path/MD5/SHA1/SHA256 и т. д.) - проверяются только ОНИ, а не вся история, чтобы не закрывать
+#   и не уведомлять повторно по старым, уже не актуальным данным.
+#   Работает и из обычного UI (Complete-Scan, после обычного сканирования), и из -ScheduledScan (headless,
+#   см. выше) - поэтому сама функция объявлена ДО блока "if ($ScheduledScan) {...; exit}" ниже (в headless-режиме
+#   скрипт до UI-блока с остальными функциями блокировки вообще не доходит), а внутри проверяет $ScheduledScan,
+#   чтобы: в headless-режиме дождаться результата синхронно (Wait-Job) и записать его в файловый журнал
+#   (Write-LogFile - доступна всегда), а в обычном UI-режиме не блокировать окно и поставить задание на
+#   наблюдение таймером (Register-UiJob/Complete-BlockApply - доступны только в UI-режиме, но к моменту, когда
+#   этот код реально выполнится по нажатию кнопки, они уже определены).
+#   Локальные: $blocks - активные блокировки; $b - текущая блокировка; $algo/$hash - её алгоритм и хэш;
+#   $matches - строки сканирования с таким же хэшем; $map - "компьютер -> пути к файлу"; $notifyText - текст
+#   уведомления с именем файла; $label - текст для журнала; $job - фоновое задание закрытия; $result - его итог
+#   (только в headless-режиме, см. Receive-JobResults).
+function Invoke-BlockSweep {
+    param([Parameter(Mandatory)][object[]]$Rows)
+    if ($Rows.Count -eq 0) { return }
+    $blocks = @((Get-BlockTable).Rows | Where-Object { [int]$_.Active -eq 1 })
+    if ($blocks.Count -eq 0) { return }
+
+    foreach ($b in $blocks) {
+        $algo = [string]$b.Algorithm
+        $hash = [string]$b.Hash
+        $matches = @($Rows | Where-Object { [string]$_.$algo -eq $hash })
+        if ($matches.Count -eq 0) { continue }
+
+        $map = @{}
+        foreach ($m in $matches) {
+            $key = ([string]$m.Computer).ToUpper()
+            $path = [string]$m.Path
+            if (-not $map.ContainsKey($key)) { $map[$key] = @() }
+            if ($map[$key] -notcontains $path) { $map[$key] += $path }
+        }
+        $notifyText = $script:NotifyTemplate -f ([string]$b.Name)
+        $label = "'{0}' ({1} {2})" -f $b.Name, $algo, $hash
+
+        try {
+            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $false -RestrictOwnerSam '' -SkipGpUpdate $true
+        }
+        catch {
+            $msg = "После сканирования: не удалось запустить закрытие $label - $($_.Exception.Message)"
+            if ($ScheduledScan) { Write-LogFile -Message $msg } else { Write-Log $msg }
+            continue
+        }
+
+        $msg = "После сканирования: заблокированный файл $label обнаружен запущенным на $($map.Count) компьютер(ах) - закрываю..."
+        if ($ScheduledScan) {
+            Write-LogFile -Message $msg
+            $null = Wait-Job -Job $job -Timeout 300
+            $result = Receive-JobResults -Job $job
+            foreach ($r in $result.Data) {
+                Write-LogFile -Message ("[{0}] найдено: {1}; завершено: {2}; уведомлено: {3}" -f $r.Computer, $r.Found, $r.Killed, $r.Notified)
+            }
+            foreach ($f in $result.Failures) {
+                Write-LogFile -Message ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
+            }
+        }
+        else {
+            Write-Log $msg
+            Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
+        }
+    }
 }
 
 if ($ScheduledScan) {
@@ -1821,7 +1910,6 @@ $tabProcesses.Controls.Add($procBar)
 #   $btnUnblock - "Снять блокировку"; $btnCheckEvents - "Проверить срабатывания" (ищет в журнале событий Windows
 #   попытки запуска заблокированного файла после даты блокировки - см. Invoke-CheckBlockEvents, там же оговорка
 #   про недоказанность кодов событий); $script:BlockGrid - таблица всех блокировок.
-$script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
 $blockBar = New-Toolbar
 $script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
 $script:LinkCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 340; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
@@ -2109,6 +2197,7 @@ function Complete-Scan {
         -Succeeded $result.Succeeded -Failed $result.Failures.Count
     Write-Log ("Сбор завершён: компьютеров {0} из {1}, записей {2}" -f $result.Succeeded, $requested, $result.Data.Count)
     Set-Status ("Сбор завершён: компьютеров {0} из {1}, записей {2}" -f $result.Succeeded, $requested, $result.Data.Count)
+    Invoke-BlockSweep -Rows $result.Data.ToArray()
 
     Update-ScanList -SelectScanId $scan.Id
     $tabs.SelectedTab = $tabProcesses
