@@ -699,7 +699,9 @@ $script:CollectScript = {
 #   параметр оставлен для тестов и на случай, если понадобится более осторожный режим "только gpupdate").
 #   $NotifyText - текст уведомления (без имени файла - оно подставляется автоматически).
 #   $LogoffSessions - завершать ли принудительно сеанс пользователя, у которого процесс был завершён ($true/$false).
-#   Возвращает объект { Computer, GpUpdate ("OK" или код), TerminateRequested, Found (сколько запущенных экземпляров
+#   Возвращает объект { Computer, GpUpdate ("OK" или код), GpUpdateOutput (текст, который вывел gpupdate.exe -
+#   заполняется только при ненулевом коде, чтобы сразу видеть причину сбоя без похода за gpresult /h),
+#   TerminateRequested, Found (сколько запущенных экземпляров
 #   найдено - считается независимо от TerminateRequested), Killed (сколько реально завершено),
 #   Notified (скольким пользователям показано уведомление), LoggedOff (сколько сеансов принудительно завершено -
 #   один раз на сеанс (SessionId), даже если в нём было несколько запущенных экземпляров), FailReasons (причины
@@ -720,6 +722,7 @@ $script:ApplyBlockScript = {
     $res = New-Object PSObject -Property @{
         Computer           = $env:COMPUTERNAME
         GpUpdate           = ''
+        GpUpdateOutput     = ''
         TerminateRequested = [bool]$TerminateProcesses
         Found              = 0
         Killed             = 0
@@ -737,8 +740,15 @@ $script:ApplyBlockScript = {
         21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
-        & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { $res.GpUpdate = 'OK' } else { $res.GpUpdate = 'код ' + $LASTEXITCODE }
+        $gpOut = & "$env:windir\System32\gpupdate.exe" /target:computer /force 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0) {
+            $res.GpUpdate = 'OK'
+        }
+        else {
+            $res.GpUpdate = 'код ' + $LASTEXITCODE
+            # Выводим реальный текст gpupdate.exe, чтобы ненулевой код было видно сразу в журнале, без похода за gpresult /h на сам компьютер.
+            $res.GpUpdateOutput = ($gpOut -replace '[\r\n]+', ' ').Trim()
+        }
 
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
         if ($paths.Count -gt 0) {
@@ -2087,6 +2097,7 @@ function Complete-BlockApply {
     $result = Receive-JobResults -Job $Job
     foreach ($r in $result.Data) {
         $line = "[{0}] gpupdate: {1}" -f $r.Computer, $r.GpUpdate
+        if ($r.GpUpdateOutput) { $line += " (вывод: $($r.GpUpdateOutput))" }
         if ($r.TerminateRequested) {
             $line += "; найдено запущенных: {0}; завершено: {1}; уведомлено пользователей: {2}" -f $r.Found, $r.Killed, $r.Notified
             if ($r.LoggedOff -gt 0) { $line += "; завершено сеансов: {0}" -f $r.LoggedOff }
