@@ -481,6 +481,36 @@ function Get-AdComputers {
     }
 }
 
+# Get-AdOrganizationalUnits - список подразделений (OU) домена для выпадающего списка "Привязать к" на вкладке
+#   "Блокировки" (чтобы не искать и не копировать DN вручную). Первой строкой всегда идёт корень домена (сам домен
+#   тоже можно выбрать как цель привязки GPO - это применит правило ко всем компьютерам домена).
+#   Возвращает объекты { Name = имя OU (для домена - сам DN), Dn = полный DN }, отсортированные по DN (так
+#   вложенные OU идут предсказуемо рядом с родительскими). Локальные: $root - корень домена (RootDSE);
+#   $domainDn - его DN; $searcher - объект поиска; $results - найденные OU; $r - текущая запись.
+function Get-AdOrganizationalUnits {
+    $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
+    $domainDn = [string]$root.Properties['defaultNamingContext'][0]
+    [pscustomobject]@{ Name = '(весь домен)'; Dn = $domainDn }
+
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
+    $searcher.Filter = '(objectCategory=organizationalUnit)'
+    $searcher.PageSize = 1000
+    [void]$searcher.PropertiesToLoad.Add('name')
+    [void]$searcher.PropertiesToLoad.Add('distinguishedname')
+
+    $results = $searcher.FindAll()
+    try {
+        foreach ($r in ($results | Sort-Object { [string]$_.Properties['distinguishedname'][0] })) {
+            [pscustomobject]@{ Name = [string]$r.Properties['name'][0]; Dn = [string]$r.Properties['distinguishedname'][0] }
+        }
+    }
+    finally {
+        $results.Dispose()
+        $searcher.Dispose()
+    }
+}
+
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
 #   Читает Win32_Process; для каждого процесса определяет владельца (пользователя, запустившего процесс) методом
 #   GetOwner(), берёт время его запуска (Win32_Process.CreationDate) и для каждого уникального файла считает
@@ -1362,7 +1392,10 @@ $tabProcesses.Controls.Add($procBar)
 # --- Вкладка "Блокировки" --------------------------------------------------
 # Вкладка "Блокировки":
 #   $blockBar - панель инструментов; $script:GpoBox - имя GPO, в которую добавляются правила;
-#   $script:LinkBox - DN контейнера, к которому привязать GPO (необязательно).
+#   $script:LinkCombo - DN контейнера, к которому привязать GPO (необязательно); редактируемый выпадающий
+#   список: можно вставить/набрать DN вручную, а можно выбрать OU из списка, который загружает $btnLoadOUs
+#   (см. Import-AdOUs) - пункты показываются как "Имя OU — DN", а при блокировке используется только DN
+#   (после последнего " — " в тексте поля; если разделителя нет - весь текст считается DN, как раньше).
 #   На известных компьютерах (где файл встречался в последнем сканировании) блокировка автоматически: обновляет
 #   политики (gpupdate), завершает уже запущенные экземпляры файла и показывает каждому затронутому пользователю
 #   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков.
@@ -1370,10 +1403,11 @@ $tabProcesses.Controls.Add($procBar)
 $script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
 $blockBar = New-Toolbar
 $script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
-$script:LinkBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 300; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
+$script:LinkCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 340; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
+$btnLoadOUs = New-Button 'Загрузить OU из AD' 160
 $btnUnblock = New-Button 'Снять блокировку' 140
-$blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, необязательно):'), $script:LinkBox,
-        $btnUnblock))
+$blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, можно выбрать из списка):'), $script:LinkCombo,
+        $btnLoadOUs, $btnUnblock))
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
@@ -1487,6 +1521,43 @@ function Import-AdComputers {
     finally {
         $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
+}
+
+# Import-AdOUs - обработчик "Загрузить OU из AD": заполняет $script:LinkCombo списком "Имя — DN"
+#   (первый пункт - "(весь домен) — <DN домена>"), сохраняя уже введённый пользователем текст поля.
+#   $kept - текст поля до обновления (чтобы не сбрасывать то, что уже набрано/выбрано); $ous - полученные OU.
+function Import-AdOUs {
+    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    try {
+        Set-Status 'Запрос списка подразделений (OU) из AD...'
+        $kept = $script:LinkCombo.Text
+        $ous = @(Get-AdOrganizationalUnits)
+        $script:LinkCombo.Items.Clear()
+        foreach ($ou in $ous) { [void]$script:LinkCombo.Items.Add(('{0} — {1}' -f $ou.Name, $ou.Dn)) }      # внешние скобки обязательны: внутри .Add(...) запятая разделяет аргументы метода, а не части -f
+        $script:LinkCombo.Text = $kept
+        Write-Log "Из AD получено подразделений (OU): $($ous.Count - 1)"
+        Set-Status "Из AD получено подразделений (OU): $($ous.Count - 1)"
+    }
+    catch {
+        Write-Log "Ошибка запроса OU из AD: $($_.Exception.Message)"
+        Show-Message -Text "Не удалось получить список OU из AD:`n$($_.Exception.Message)" -Icon Error
+        Set-Status 'Ошибка запроса OU из AD'
+    }
+    finally {
+        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+}
+
+# ConvertTo-LinkTargetDn - достаёт DN из текста поля "Привязать к". Если выбран пункт списка (есть " — "),
+#   возвращает часть после ПОСЛЕДНЕГО " — " (имя OU не экранируется и теоретически может содержать такую же
+#   подстроку, поэтому берём последнее вхождение - сам DN её в норме не содержит). Иначе считает весь текст
+#   DN, набранным или вставленным вручную, как было до появления списка. -Text содержимое поля.
+function ConvertTo-LinkTargetDn {
+    param([string]$Text)
+    $Text = $Text.Trim()
+    $sep = $Text.LastIndexOf(' — ')
+    if ($sep -ge 0) { return $Text.Substring($sep + 3).Trim() }
+    return $Text
 }
 
 # ---------------------------------------------------------------------------
@@ -1685,7 +1756,7 @@ function Invoke-BlockSelected {
     $size = 0L
     if ($row['Size'] -isnot [DBNull]) { $size = [long]$row['Size'] }
     $gpo = $script:GpoBox.Text.Trim()
-    $linkTarget = $script:LinkBox.Text.Trim()
+    $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
 
     if (-not $gpo) {
         Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
@@ -1870,6 +1941,7 @@ $script:AlgoCombo.Add_SelectedIndexChanged({ Update-ProcessGrid })
 $script:FilterBox.Add_TextChanged({ Update-ProcessFilter })
 $btnRefresh.Add_Click({ Update-ScanList })
 $btnBlock.Add_Click({ Invoke-BlockSelected })
+$btnLoadOUs.Add_Click({ Import-AdOUs })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
