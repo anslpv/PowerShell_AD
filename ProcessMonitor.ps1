@@ -9,9 +9,12 @@
       * по WinRM собирает запущенные процессы и их хэши (MD5 / SHA1 / SHA256);
       * показывает таблицу |№|Время запуска процесса|Имя|Хэш| (плюс компьютер, пользователь и путь) и хранит
         историю в JSON-файлах;
-      * блокирует запуск файла с выбранным хэшем хэш-правилом SRP в доменной GPO, по одной или сразу нескольким
-        строкам;
-      * умеет проверять по журналу событий Windows, не пытались ли запускать уже заблокированный файл;
+      * блокирует запуск файла с выбранным хэшем - список блокировок хранится в своих данных приложения
+        (никакой групповой политики), по одной или сразу нескольким строкам;
+      * сама следит за уже активными блокировками: после каждого сканирования (ручного или планового) сверяет
+        собранные процессы со списком блокировок и, если находит совпадение, сразу закрывает процесс, уведомляет
+        пользователя и, если для этой блокировки включено, завершает его сеанс и полностью отключает его учётную
+        запись в домене (см. README.md - это отдельная, опциональная на каждую блокировку мера);
       * умеет сканировать компьютеры по расписанию без окна (-ScheduledScan, см. README.md).
 
     Скрипт самодостаточный (один файл), сторонних драйверов не требует.
@@ -19,7 +22,7 @@
 
 .PARAMETER SelfTest
     Не открывать окно, а проверить на этом компьютере всё, от чего зависит работа (версия PowerShell, JSON-хранилище,
-    хэширование, Windows Forms, WinRM, AD, модуль GroupPolicy), и вывести [ OK ] / [WARN] / [FAIL] по каждому пункту.
+    хэширование, Windows Forms, WinRM, AD), и вывести [ OK ] / [WARN] / [FAIL] по каждому пункту.
 
 .PARAMETER DataPath
     Папка для JSON-файлов с данными. По умолчанию data рядом со скриптом. Прежнее имя -DbPath работает как псевдоним.
@@ -82,7 +85,7 @@ $DataPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSP
 # $script:Scans    - список сканирований из scans.json, держится в памяти (ArrayList словарей: Id, ScanDate, Requested,
 #                    Succeeded, Failed, Computers). Процессы в память целиком не загружаются - читаются по запросу.
 # $script:Blocks   - журнал блокировок из blocks.json в памяти (ArrayList словарей: Id, BlockDate, Name, Algorithm,
-#                    Hash, Size, GpoName, RuleId, Active).
+#                    Hash, Size, Active, LockAccount, EventCount, LastEventTime).
 # $script:JsonSerializer - JavaScriptSerializer из .NET Framework, используется ТОЛЬКО для чтения JSON (быстро и даёт чистые
 #                    .NET-словари). Запись идёт через ConvertTo-Json. Если JavaScriptSerializer недоступен или
 #                    сбойнул (например, при проверке на PowerShell 7), чтение идёт через ConvertFrom-Json.
@@ -393,35 +396,32 @@ function Get-HashLocations {
 # ---- Блокировки ------------------------------------------------------------
 
 # Add-BlockRecord - записывает в журнал блокировок (blocks.json) новую активную блокировку.
-#   -Name имя файла; -Algorithm и -Hash хэш; -Size размер файла; -GpoName в какой GPO добавлено правило;
-#   -RuleId GUID правила в GPO (по нему правило потом удаляется). Номер записи = максимальный + 1.
+#   -Name имя файла; -Algorithm и -Hash хэш; -Size размер файла; -LockAccount - блокировать ли ПОЛНОСТЬЮ учётную
+#   запись в домене (см. README.md) у того, кого поймают запустившим этот файл - помимо закрытия самого процесса
+#   и уведомления (решается один раз здесь, при создании блокировки, а не каждый раз при обнаружении).
+#   Номер записи = максимальный + 1.
 function Add-BlockRecord {
     param(
         [string]$Name,
         [Parameter(Mandatory)][string]$Algorithm,
         [Parameter(Mandatory)][string]$Hash,
         [long]$Size,
-        [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$RuleId,
-        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
-        [string]$Target = 'Все пользователи компьютера'
+        [bool]$LockAccount = $false
     )
     $id = 1
     foreach ($b in $script:Blocks) {
         if ([int]$b['Id'] -ge $id) { $id = [int]$b['Id'] + 1 }
     }
     [void]$script:Blocks.Add([ordered]@{
-            Id        = $id
-            BlockDate = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-            Name      = $Name
-            Algorithm = $Algorithm
-            Hash      = $Hash.ToUpper()
-            Size      = $Size
-            GpoName   = $GpoName
-            RuleId    = $RuleId
-            Active    = 1
-            Scope     = $Scope
-            Target    = $Target
+            Id          = $id
+            BlockDate   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Name        = $Name
+            Algorithm   = $Algorithm
+            Hash        = $Hash.ToUpper()
+            Size        = $Size
+            Active      = 1
+            LockAccount = [int]$LockAccount
+            EventCount  = 0
         })
     try {
         Save-BlockLog
@@ -433,12 +433,12 @@ function Add-BlockRecord {
 }
 
 # Get-BlockTable - все блокировки (новые сверху) для вкладки "Блокировки".
-#   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime - результат последней проверки
-#   срабатываний (см. Update-BlockEventInfo); у блокировок, которые ещё не проверяли, EventCount = -1
-#   ("не проверялось" - отличие от 0, то есть "проверили, попыток не было"), LastEventTime пусто.
-#   Scope/Target - новые поля ("для кого" заблокировано: вся машина или конкретный пользователь/группа, см.
-#   Add-BlockRecord); у записей, сделанных до появления этой возможности, их нет в файле на диске, поэтому
-#   читаются с запасным значением ('Computer'/'Все пользователи компьютера') - как раз для таких старых записей.
+#   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime - сколько раз и когда в последний
+#   раз сканирование заставало этот файл запущенным уже ПОСЛЕ блокировки (см. Register-BlockHit - считает сама
+#   проверка после сканирования, журнал событий Windows не используется). LockAccount - заблокирована ли
+#   ПОЛНОСТЬЮ учётная запись того, кого поймают с этим файлом (см. Add-BlockRecord); у записей, сделанных до
+#   появления этой возможности, поля LockAccount/EventCount нет в файле на диске, поэтому читаются с запасным
+#   значением (0) - для них галочки на вкладке "Блокировки" просто окажутся пустыми/нулевыми.
 function Get-BlockTable {
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('Id', [int])
@@ -446,33 +446,25 @@ function Get-BlockTable {
     [void]$table.Columns.Add('Name', [string])
     [void]$table.Columns.Add('Algorithm', [string])
     [void]$table.Columns.Add('Hash', [string])
-    [void]$table.Columns.Add('GpoName', [string])
-    [void]$table.Columns.Add('RuleId', [string])
     [void]$table.Columns.Add('Active', [int])
     [void]$table.Columns.Add('Status', [string])
+    [void]$table.Columns.Add('LockAccount', [string])
     [void]$table.Columns.Add('EventCount', [int])
-    [void]$table.Columns.Add('Occurrences', [string])
     [void]$table.Columns.Add('LastEventTime', [string])
-    [void]$table.Columns.Add('Scope', [string])
-    [void]$table.Columns.Add('Target', [string])
     for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
         $b = $script:Blocks[$i]
         $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
-        $eventCount = -1
+        $eventCount = 0
         # .Contains(), а не .ContainsKey(): свежедобавленные за этот сеанс записи - OrderedDictionary ([ordered]@{...}
         # в Add-BlockRecord), а у неё нет ContainsKey (есть только у Hashtable, в который превращаются записи ПОСЛЕ
         # перечитывания с диска). .Contains() есть у обоих типов.
         if ($b.Contains('EventCount')) { $eventCount = [int]$b['EventCount'] }
         $lastEventTime = ''
         if ($b.Contains('LastEventTime')) { $lastEventTime = [string]$b['LastEventTime'] }
-        $scope = 'Computer'
-        if ($b.Contains('Scope') -and $b['Scope']) { $scope = [string]$b['Scope'] }
-        $target = 'Все пользователи компьютера'
-        if ($b.Contains('Target') -and $b['Target']) { $target = [string]$b['Target'] }
-        $occurrences = if ($eventCount -lt 0) { 'не проверялось' } else { [string]$eventCount }
+        $lockAccount = 'Нет'
+        if ($b.Contains('LockAccount') -and [int]$b['LockAccount'] -eq 1) { $lockAccount = 'Да' }
         [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
-            [string]$b['Hash'], [string]$b['GpoName'], [string]$b['RuleId'], [int]$b['Active'], $status,
-            $eventCount, $occurrences, $lastEventTime, $scope, $target)
+            [string]$b['Hash'], [int]$b['Active'], $status, $lockAccount, $eventCount, $lastEventTime)
     }
     return , $table
 }
@@ -498,41 +490,23 @@ function Disable-BlockRecord {
     Save-BlockLog
 }
 
-# Update-BlockEventInfo - сохраняет результат проверки срабатываний блокировки (см. Invoke-CheckBlockEvents):
-#   сколько событий отказа SRP найдено и когда было последнее. -Id номер записи; -Count сколько найдено;
-#   -LastTime когда было последнее (пусто, если не найдено ни одного).
-function Update-BlockEventInfo {
-    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][int]$Count, [string]$LastTime)
+# Register-BlockHit - отмечает, что сканирование (ручное или плановое) застало заблокированный файл запущенным
+#   УЖЕ ПОСЛЕ блокировки - вызывается из Invoke-BlockSweep при каждом совпадении, а не по запросу администратора
+#   (в отличие от прежней кнопки "Проверить срабатывания", которая опиралась на журнал событий Windows - теперь
+#   этого источника нет, но он и не нужен: сама проверка после сканирования и есть факт обнаружения).
+#   -Id номер записи; -Count на скольких компьютерах нашли за этот один проход (прибавляется к счётчику, а не
+#   заменяет его - EventCount копит сумму за всё время). Обновляет и EventCount, и LastEventTime (текущее время).
+function Register-BlockHit {
+    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][int]$Count)
     foreach ($b in $script:Blocks) {
         if ([int]$b['Id'] -eq $Id) {
-            $b['EventCount'] = $Count
-            $b['LastEventTime'] = $LastTime
+            $current = 0
+            if ($b.Contains('EventCount')) { $current = [int]$b['EventCount'] }
+            $b['EventCount'] = $current + $Count
+            $b['LastEventTime'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
         }
     }
     Save-BlockLog
-}
-
-# Get-HashComputersEver - на каких компьютерах хэш встречался хоть КОГДА-НИБУДЬ (по всем сканированиям, а не
-#   только по последнему для каждого компьютера, в отличие от Get-HashLocations). Нужна для проверки
-#   срабатываний: опрашивать стоит и те компьютеры, где файл уже не бежит, но раньше встречался - именно там
-#   он мог сработать после блокировки. Читает файлы ВСЕХ сканирований, поэтому при большой истории (сотни
-#   сканирований) может быть не быстрой - как и просмотр "Все сканирования" на вкладке "Процессы".
-#   Локальные: $wanted - хэш в верхнем регистре; $computers - найденные имена (ключи хэш-таблицы, без повторов);
-#   $scan - текущее сканирование; $doc - его файл; $p - текущий процесс в нём.
-function Get-HashComputersEver {
-    param(
-        [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
-        [Parameter(Mandatory)][string]$Hash
-    )
-    $wanted = $Hash.ToUpper()
-    $computers = @{}
-    foreach ($scan in $script:Scans) {
-        $doc = Read-JsonFile -Path (Get-ScanFilePath -Id ([int]$scan['Id']))
-        foreach ($p in (Get-JsonList -Document $doc -Key 'Processes')) {
-            if ([string]$p[$Algorithm] -eq $wanted) { $computers[[string]$p['Computer']] = $true }
-        }
-    }
-    return @($computers.Keys | Sort-Object)
 }
 
 # ===========================================================================
@@ -575,78 +549,21 @@ function Get-AdComputers {
     }
 }
 
-# Get-AdOrganizationalUnits - список подразделений (OU) домена для выпадающего списка "Привязать к" на вкладке
-#   "Блокировки" (чтобы не искать и не копировать DN вручную). Первой строкой всегда идёт корень домена (сам домен
-#   тоже можно выбрать как цель привязки GPO - это применит правило ко всем компьютерам домена).
-#   Возвращает объекты { Name = имя OU (для домена - сам DN), Dn = полный DN }, отсортированные по DN (так
-#   вложенные OU идут предсказуемо рядом с родительскими). Локальные: $root - корень домена (RootDSE);
-#   $domainDn - его DN; $searcher - объект поиска; $results - найденные OU; $r - текущая запись.
-function Get-AdOrganizationalUnits {
-    $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
-    $domainDn = [string]$root.Properties['defaultNamingContext'][0]
-    [pscustomobject]@{ Name = '(весь домен)'; Dn = $domainDn }
-
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher
-    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
-    $searcher.Filter = '(objectCategory=organizationalUnit)'
-    $searcher.PageSize = 1000
-    [void]$searcher.PropertiesToLoad.Add('name')
-    [void]$searcher.PropertiesToLoad.Add('distinguishedname')
-
-    $results = $searcher.FindAll()
-    try {
-        foreach ($r in ($results | Sort-Object { [string]$_.Properties['distinguishedname'][0] })) {
-            [pscustomobject]@{ Name = [string]$r.Properties['name'][0]; Dn = [string]$r.Properties['distinguishedname'][0] }
-        }
-    }
-    finally {
-        $results.Dispose()
-        $searcher.Dispose()
-    }
-}
-
-# Get-AdUsersAndGroups - пользователи и группы AD для выпадающего списка "Пользователь/группа" на вкладке
-#   "Блокировки" (блокировка не для всех, а для конкретной учётной записи или группы - см. Invoke-BlockSelected).
-#   Как и Get-AdOrganizationalUnits, грузит весь список сразу и может быть не быстрой в большом домене.
-#   Возвращает { Sam = sAMAccountName (именно он нужен Set-GPPermission); Display = отображаемое имя;
-#   Type = 'User' или 'Group' }, отсортированные по Display. Записи без sAMAccountName пропускаются.
-#   Локальные: $root/$domainDn/$searcher/$results/$r - как в Get-AdOrganizationalUnits; $sam/$display/$cat/$type -
-#   поля текущей записи ($cat - DN класса объекта, по нему отличаем группу от пользователя).
-function Get-AdUsersAndGroups {
-    $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
-    $domainDn = [string]$root.Properties['defaultNamingContext'][0]
-    $searcher = New-Object System.DirectoryServices.DirectorySearcher
-    $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
-    $searcher.Filter = '(|(&(objectCategory=person)(objectClass=user))(objectCategory=group))'
-    $searcher.PageSize = 1000
-    foreach ($prop in 'samaccountname', 'displayname', 'name', 'objectcategory') {
-        [void]$searcher.PropertiesToLoad.Add($prop)
-    }
-
-    $results = $searcher.FindAll()
-    try {
-        foreach ($r in ($results | Sort-Object {
-                    if ($_.Properties['displayname'].Count) { [string]$_.Properties['displayname'][0] } else { [string]$_.Properties['name'][0] }
-                })) {
-            $sam = if ($r.Properties['samaccountname'].Count) { [string]$r.Properties['samaccountname'][0] } else { '' }
-            if (-not $sam) { continue }
-            $display = if ($r.Properties['displayname'].Count) { [string]$r.Properties['displayname'][0] } else { [string]$r.Properties['name'][0] }
-            $cat = [string]$r.Properties['objectcategory'][0]
-            $type = if ($cat -match '(?i)^CN=Group,') { 'Group' } else { 'User' }
-            [pscustomobject]@{ Sam = $sam; Display = $display; Type = $type }
-        }
-    }
-    finally {
-        $results.Dispose()
-        $searcher.Dispose()
-    }
-}
-
-# Resolve-AdPrincipalType - определяет, пользователь это или группа, по sAMAccountName, если тип не пришёл
-#   вместе с выбором из списка (например, имя набрано вручную). -Sam  sAMAccountName. Возвращает 'User',
-#   'Group' или $null (учётная запись не найдена или AD недоступен - вызывающий код должен в этом случае
-#   остановиться и попросить выбрать запись из списка, а не угадывать тип).
-function Resolve-AdPrincipalType {
+# Disable-AdAccount - ПОЛНОСТЬЮ отключает учётную запись пользователя в AD (бит ACCOUNTDISABLE = 0x2 в атрибуте
+#   userAccountControl) - человек не сможет войти вообще никуда в домене (ни на один компьютер, почту и т. п.),
+#   пока администратор не включит учётную запись обратно вручную. Используется для блокировок с LockAccount=1
+#   (см. Add-BlockRecord) - вызывается с машины АДМИНИСТРАТОРА (не с того компьютера, где процесс был пойман:
+#   запись в AD оттуда скорее всего не сработала бы из-за "двойного перехода" Kerberos - у Invoke-Command нет
+#   делегирования учётных данных администратора на третью систему, то есть на контроллер домена - поэтому
+#   сервер/компьютер пытался бы обратиться к AD от своего ИМЕНИ, а не от имени администратора, и, скорее всего,
+#   получил бы отказ в доступе). Через ADSI (System.DirectoryServices), без модуля ActiveDirectory - как и
+#   остальная работа с AD в этом приложении.
+#   -Sam  sAMAccountName пользователя (без имени домена). Возвращает $true, если учётная запись найдена и
+#   отключена, $false - если её не нашли, или отключить не удалось (нет прав, AD недоступен и т. п.);
+#   вызывающий код должен в этом случае залогировать неудачу, а не считать её исключением.
+#   Локальные: $root/$domainDn - корень домена; $searcher - объект поиска; $result - найденная запись;
+#   $user - сам объект пользователя (для записи); $uac - текущее значение userAccountControl.
+function Disable-AdAccount {
     param([Parameter(Mandatory)][string]$Sam)
     $searcher = $null
     try {
@@ -655,14 +572,17 @@ function Resolve-AdPrincipalType {
         $searcher = New-Object System.DirectoryServices.DirectorySearcher
         $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$domainDn")
         $searcher.Filter = "(sAMAccountName=$Sam)"
-        [void]$searcher.PropertiesToLoad.Add('objectcategory')
-        $r = $searcher.FindOne()
-        if (-not $r) { return $null }
-        $cat = [string]$r.Properties['objectcategory'][0]
-        return $(if ($cat -match '(?i)^CN=Group,') { 'Group' } else { 'User' })
+        [void]$searcher.PropertiesToLoad.Add('useraccountcontrol')
+        $result = $searcher.FindOne()
+        if (-not $result) { return $false }
+        $user = $result.GetDirectoryEntry()
+        $uac = [int]$user.Properties['userAccountControl'][0]
+        $user.Properties['userAccountControl'].Value = $uac -bor 0x2
+        $user.CommitChanges()
+        return $true
     }
     catch {
-        return $null
+        return $false
     }
     finally {
         if ($searcher) { $searcher.Dispose() }
@@ -763,64 +683,49 @@ $script:CollectScript = {
     }
 }
 
-# $script:ApplyBlockScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере сразу после добавления блокировки:
-#   принудительно обновляет групповые политики (gpupdate /target:computer /force), чтобы правило SRP подействовало
-#   немедленно, а не ждало планового обновления (по умолчанию - до 90 минут), затем ЗАВЕРШАЕТ уже запущенные
+# $script:ApplyBlockScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере: ЗАВЕРШАЕТ уже запущенные
 #   экземпляры заблокированного файла и показывает каждому затронутому пользователю на экране (msg.exe) короткое
-#   уведомление, что запускать это нельзя. По отдельному запросу (-LogoffSessions, администратор подтверждает его
-#   каждый раз в окне блокировки) ПОСЛЕ уведомления также принудительно завершает сеанс (logoff.exe) именно того
-#   пользователя, у кого был открыт процесс, - это закрывает ВСЕ его программы на этом компьютере, не только
-#   заблокированный файл, поэтому не делается по умолчанию. Всё это происходит автоматически при блокировке.
+#   уведомление, что запускать это нельзя. По отдельному запросу (-LogoffSessions) ПОСЛЕ уведомления также
+#   принудительно завершает сеанс (logoff.exe) именно того пользователя, у кого был открыт процесс, - это
+#   закрывает ВСЕ его программы на этом компьютере, не только заблокированный файл. Никакой групповой политики
+#   не трогает вообще - единственный механизм блокировки теперь это мониторинг (см. Invoke-BlockSweep): файл
+#   закрывается, как только сканирование застаёт его запущенным, а не превентивно в момент попытки запуска.
 #   $Map  - хэш-таблица "ИМЯ КОМПЬЮТЕРА (в верхнем регистре) -> массив путей к файлу".
-#   $TerminateProcesses - завершать ли найденные запущенные экземпляры ($true/$false; UI всегда передаёт $true,
-#   параметр оставлен для тестов и на случай, если понадобится более осторожный режим "только gpupdate").
 #   $NotifyText - текст уведомления (без имени файла - оно подставляется автоматически).
 #   $LogoffSessions - завершать ли принудительно сеанс пользователя, у которого процесс был завершён ($true/$false).
-#   $RestrictOwnerSam - если не пусто, закрывать/уведомлять/завершать сеанс только у процессов, чей владелец
-#   (без имени домена) совпадает с этим именем без учёта регистра - используется для блокировки "по конкретному
-#   пользователю" (Scope=User), чтобы не закрыть легитимно запущенный тот же файл у ДРУГИХ пользователей
-#   компьютера, для которых правило SRP не действует. Для блокировки "по группе" такой проверки нет (сверить
-#   членство в группе можно было бы только обращением к AD с этого же компьютера, что не проверено на реальном
-#   домене - см. общую оговорку про недоказанные Windows-специфичные места в начале разговора) - поэтому для
-#   групп, как и для обычной блокировки на весь компьютер, закрываются все текущие запущенные экземпляры файла
-#   независимо от того, кто их запустил; постоянная защита (новые попытки запуска) при этом всё равно верно
-#   ограничена только членами группы - это даёт сама Security Filtering GPO (см. Set-GpoUserFiltering), а не
-#   этот скрипт.
-#   Возвращает объект { Computer, GpUpdate ("OK" или код), GpUpdateOutput (текст, который вывел gpupdate.exe -
-#   заполняется только при ненулевом коде, чтобы сразу видеть причину сбоя без похода за gpresult /h),
-#   TerminateRequested, Found (сколько запущенных экземпляров
-#   найдено - считается независимо от TerminateRequested), Killed (сколько реально завершено),
-#   Notified (скольким пользователям показано уведомление), LoggedOff (сколько сеансов принудительно завершено -
-#   один раз на сеанс (SessionId), даже если в нём было несколько запущенных экземпляров), FailReasons (причины
-#   неудач метода Terminate, без повторов), Error }.
+#   $LockAccount - требуется ли для этой блокировки ПОЛНОСТЬЮ отключить учётную запись пойманного пользователя в
+#   AD (см. Add-BlockRecord/README.md). Сама запись в AD отсюда НЕ делается (см. Disable-AdAccount - двойной
+#   переход Kerberos не даст этому скрипту, выполняющемуся на удалённом компьютере, записать что-либо в AD от
+#   имени администратора) - этот скрипт только СОБИРАЕТ список владельцев закрытых процессов в UsersToLock,
+#   а сам вызов Disable-AdAccount и запись в отдельный журнал блокировок учётных записей делает код на машине
+#   администратора (Invoke-AccountLockFollowUp), разбирая результат уже ПОСЛЕ того, как это задание завершится.
+#   Возвращает объект { Computer, Found (сколько запущенных экземпляров найдено), Killed (сколько реально
+#   завершено), Notified (скольким пользователям показано уведомление), LoggedOff (сколько сеансов принудительно
+#   завершено - один раз на сеанс (SessionId), даже если в нём было несколько запущенных экземпляров),
+#   FailReasons (причины неудач метода Terminate, без повторов), UsersToLock (владельцы закрытых процессов,
+#   "ДОМЕН\логин", без повторов - заполняется, только если -LockAccount), Error }.
 #   Found может быть больше Killed: причина - в FailReasons (чаще всего нет прав на завершение процесса).
 #   Found = 0 при непустом $paths значит, что на момент применения процесс с таким путём уже не запущен
-#   (завершился сам, или путь в данных сканирования устарел). Уведомление и завершение сеанса выполняются, только
-#   если процесс реально завершён (TRUE Kill), и только один раз на пользователя/сеанс, даже если он держал
-#   открытыми несколько копий файла.
-#   $SkipGpUpdate - не вызывать gpupdate.exe вообще (GpUpdate в результате будет "пропущено"). Нужен для
-#   Invoke-BlockSweep - повторной проверки уже заблокированных файлов после каждого сканирования: она не зависит
-#   от групповой политики (в т. ч. не требует, чтобы GPO была привязана и вообще применялась - см. обсуждение
-#   про ошибку "LocalGPO") и не должна тратить время на обновление политик при каждом сканировании.
+#   (завершился сам, или путь в данных сканирования устарел). Уведомление, завершение сеанса и UsersToLock
+#   заполняются, только если процесс реально завершён (TRUE Kill), и только один раз на пользователя/сеанс, даже
+#   если он держал открытыми несколько копий файла.
 #   Локальные: $res - возвращаемый результат; $paths - пути, по которым ищем запущенные экземпляры;
 #   $reasonMap - код возврата Terminate() -> текст причины; $notified - кому уведомление уже отправлено;
-#   $loggedOff - какие сеансы (SessionId) уже завершены в этом запуске (защита от дублей, если у пользователя
-#   было несколько запущенных экземпляров в одном сеансе); $p - процесс из WMI; $owner - владелец именно этого
-#   запущенного экземпляра (берётся заново через GetOwner(), а не из данных сканирования - на момент блокировки
+#   $loggedOff - какие сеансы (SessionId) уже завершены в этом запуске (защита от дублей); $toLock - владельцы,
+#   которых нужно внести в UsersToLock (защита от дублей); $p - процесс из WMI; $owner - владелец именно этого
+#   запущенного экземпляра (берётся заново через GetOwner(), а не из данных сканирования - на момент применения
 #   им может быть уже другой пользователь); $r - результат Terminate(); $reason - текст причины для конкретного кода.
 $script:ApplyBlockScript = {
-    param($Map, $TerminateProcesses, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false, $RestrictOwnerSam = '', $SkipGpUpdate = $false)
+    param($Map, $NotifyText = 'Нельзя такое запускать: этот файл заблокирован политикой безопасности.', $LogoffSessions = $false, $LockAccount = $false)
     $res = New-Object PSObject -Property @{
-        Computer           = $env:COMPUTERNAME
-        GpUpdate           = ''
-        GpUpdateOutput     = ''
-        TerminateRequested = [bool]$TerminateProcesses
-        Found              = 0
-        Killed             = 0
-        Notified           = 0
-        LoggedOff          = 0
-        FailReasons        = ''
-        Error              = ''
+        Computer    = $env:COMPUTERNAME
+        Found       = 0
+        Killed      = 0
+        Notified    = 0
+        LoggedOff   = 0
+        FailReasons = ''
+        UsersToLock = @()
+        Error       = ''
     }
     # Коды возврата Win32_Process.Terminate(): https://learn.microsoft.com/windows/win32/cimwin32prov/terminate-method-in-class-win32-process
     $reasonMap = @{
@@ -831,99 +736,50 @@ $script:ApplyBlockScript = {
         21 = 'некорректный параметр (Invalid Parameter)'
     }
     try {
-        if ($SkipGpUpdate) {
-            $res.GpUpdate = 'пропущено'
-        }
-        else {
-            # Предыдущая попытка (через $OutputEncoding перед обычным "& gpupdate.exe ... | Out-String") не помогла -
-            # $OutputEncoding управляет тем, в какой кодировке PowerShell ОТПРАВЛЯЕТ текст НА ВХОД внешней программе,
-            # а не тем, как он РАСШИФРОВЫВАЕТ её вывод, так что к этой задаче он вообще не относился. Вместо того
-            # чтобы полагаться на то, как PowerShell сам решает читать вывод консольной программы (через [Console]::
-            # OutputEncoding, которого в сеансе без настоящей консоли - а именно так выполняется этот скрипт, через
-            # Invoke-Command/WinRM - может не быть вовсе), запускаем gpupdate.exe напрямую через .NET
-            # System.Diagnostics.Process и явно задаём кодировку чтения его stdout/stderr сами - это не зависит от
-            # наличия консоли и от того, что в неё "думает" PowerShell. Кодировка - настоящая OEM-кодовая страница
-            # этого компьютера (та, в которой консольные программы печатают текст), берётся из реестра, как это
-            # делает сам chcp.com; если почему-либо не получилось определить - используется кодировка по умолчанию
-            # (тогда кириллица может остаться нечитаемой, но код возврата и остальная часть применения блокировки
-            # всё равно отработают).
-            $oemEncoding = [System.Text.Encoding]::Default
-            try {
-                $oemCp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP -ErrorAction Stop).OEMCP
-                $oemEncoding = [System.Text.Encoding]::GetEncoding([int]$oemCp)
-            }
-            catch { }
-
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = "$env:windir\System32\gpupdate.exe"
-            $psi.Arguments = '/target:computer /force'
-            $psi.UseShellExecute = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.StandardOutputEncoding = $oemEncoding
-            $psi.StandardErrorEncoding = $oemEncoding
-            $gpProc = [System.Diagnostics.Process]::Start($psi)
-            $gpStdOut = $gpProc.StandardOutput.ReadToEnd()
-            $gpStdErr = $gpProc.StandardError.ReadToEnd()
-            $gpProc.WaitForExit()
-            $gpExitCode = $gpProc.ExitCode
-
-            if ($gpExitCode -eq 0) {
-                $res.GpUpdate = 'OK'
-            }
-            else {
-                $res.GpUpdate = 'код ' + $gpExitCode
-                # Выводим реальный текст gpupdate.exe, чтобы ненулевой код было видно сразу в журнале, без похода за gpresult /h на сам компьютер.
-                $res.GpUpdateOutput = (($gpStdOut + $gpStdErr) -replace '[\r\n]+', ' ').Trim()
-            }
-        }
-
         $paths = @($Map[$env:COMPUTERNAME.ToUpper()])
         if ($paths.Count -gt 0) {
             $reasons = @{}
             $notified = @{}
             $loggedOff = @{}
+            $toLock = @{}
             foreach ($p in (Get-WmiObject -Class Win32_Process)) {
                 if ($p.ExecutablePath -and ($paths -contains $p.ExecutablePath)) {
+                    $res.Found = $res.Found + 1
                     $owner = ''
                     try { $o = $p.GetOwner(); if ($o.User) { $owner = $o.User } } catch { }
-                    if ($RestrictOwnerSam) {
-                        $ownerSam = $owner
-                        $slash = $owner.LastIndexOf('\')
-                        if ($slash -ge 0) { $ownerSam = $owner.Substring($slash + 1) }
-                        if ($ownerSam -ine $RestrictOwnerSam) { continue }
+
+                    $r = $p.Terminate()
+                    if ($r.ReturnValue -eq 0) {
+                        $res.Killed = $res.Killed + 1
+                        if ($owner -and -not $notified.ContainsKey($owner)) {
+                            $notified[$owner] = $true
+                            try {
+                                & "$env:windir\System32\msg.exe" $owner /TIME:30 $NotifyText 2>&1 | Out-Null
+                                if ($LASTEXITCODE -eq 0) { $res.Notified = $res.Notified + 1 }
+                            }
+                            catch { }
+                        }
+                        if ($LogoffSessions -and -not $loggedOff.ContainsKey([int]$p.SessionId)) {
+                            $loggedOff[[int]$p.SessionId] = $true
+                            try {
+                                & "$env:windir\System32\logoff.exe" $p.SessionId 2>&1 | Out-Null
+                                if ($LASTEXITCODE -eq 0) { $res.LoggedOff = $res.LoggedOff + 1 }
+                            }
+                            catch { }
+                        }
+                        if ($LockAccount -and $owner -and -not $toLock.ContainsKey($owner)) {
+                            $toLock[$owner] = $true
+                        }
                     }
-                    $res.Found = $res.Found + 1
-                    if ($TerminateProcesses) {
-                        $r = $p.Terminate()
-                        if ($r.ReturnValue -eq 0) {
-                            $res.Killed = $res.Killed + 1
-                            if ($owner -and -not $notified.ContainsKey($owner)) {
-                                $notified[$owner] = $true
-                                try {
-                                    & "$env:windir\System32\msg.exe" $owner /TIME:30 $NotifyText 2>&1 | Out-Null
-                                    if ($LASTEXITCODE -eq 0) { $res.Notified = $res.Notified + 1 }
-                                }
-                                catch { }
-                            }
-                            if ($LogoffSessions -and -not $loggedOff.ContainsKey([int]$p.SessionId)) {
-                                $loggedOff[[int]$p.SessionId] = $true
-                                try {
-                                    & "$env:windir\System32\logoff.exe" $p.SessionId 2>&1 | Out-Null
-                                    if ($LASTEXITCODE -eq 0) { $res.LoggedOff = $res.LoggedOff + 1 }
-                                }
-                                catch { }
-                            }
-                        }
-                        else {
-                            $reason = $reasonMap[[int]$r.ReturnValue]
-                            if (-not $reason) { $reason = 'код ' + $r.ReturnValue }
-                            $reasons[$reason] = $true
-                        }
+                    else {
+                        $reason = $reasonMap[[int]$r.ReturnValue]
+                        if (-not $reason) { $reason = 'код ' + $r.ReturnValue }
+                        $reasons[$reason] = $true
                     }
                 }
             }
             $res.FailReasons = (@($reasons.Keys | Sort-Object) -join '; ')
+            $res.UsersToLock = @($toLock.Keys)
         }
     }
     catch {
@@ -1014,64 +870,18 @@ function Start-Collection {
     return $job
 }
 
-# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик, завершение процессов,
-#   уведомление и, по желанию, принудительное завершение сеанса пользователей) на компьютерах, где найден
-#   заблокированный файл.
+# Start-BlockApply - в фоне запускает $script:ApplyBlockScript (завершение процессов, уведомление и, по
+#   желанию, принудительное завершение сеанса пользователей) на компьютерах, где найден заблокированный файл.
 #   -Map  "ИМЯ КОМПЬЮТЕРА -> пути к файлу" (ключи Map - список компьютеров);
-#   -TerminateProcesses  завершать ли найденные запущенные экземпляры;
 #   -NotifyText  текст уведомления пользователю при завершении его процесса;
-#   -LogoffSessions  завершать ли принудительно сеанс пользователя после завершения его процесса. Возвращает задание.
+#   -LogoffSessions  завершать ли принудительно сеанс пользователя после завершения его процесса;
+#   -LockAccount  требуется ли для этой блокировки блокировать учётную запись пойманных пользователей в AD
+#   (см. $script:ApplyBlockScript/Invoke-AccountLockFollowUp). Возвращает задание.
 function Start-BlockApply {
-    param([Parameter(Mandatory)][hashtable]$Map, [bool]$TerminateProcesses = $false, [string]$NotifyText, [bool]$LogoffSessions = $false, [string]$RestrictOwnerSam = '', [bool]$SkipGpUpdate = $false)
+    param([Parameter(Mandatory)][hashtable]$Map, [string]$NotifyText, [bool]$LogoffSessions = $false, [bool]$LockAccount = $false)
     Invoke-Command -ComputerName @($Map.Keys) -ScriptBlock $script:ApplyBlockScript `
-        -ArgumentList $Map, $TerminateProcesses, $NotifyText, $LogoffSessions, $RestrictOwnerSam, $SkipGpUpdate -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
+        -ArgumentList $Map, $NotifyText, $LogoffSessions, $LockAccount -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 `
         -AsJob -JobName 'ProcMon-Apply'
-}
-
-# $script:SrpEventScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере: ищет в журнале событий Windows
-#   следы того, что кто-то пытался запустить ИМЕННО этот заблокированный файл после указанного момента времени.
-#   Software Restriction Policies при отказе в запуске пишет событие в журнал Application от источника "SRP"
-#   с одним из кодов 865 (запрещено по пути), 866 (по хэшу - это как раз наш случай), 867 (по сертификату),
-#   868 (по зоне Интернета) или 882 (запрещено правилом по умолчанию). ВАЖНО: эти коды и имя источника - по
-#   документации Microsoft, НЕ проверены на реальном журнале событий (нет доступа к Windows для проверки);
-#   если на практике они окажутся другими, функция просто ничего не найдёт (поймано в try/catch), а не упадёт
-#   с ошибкой - то есть худший случай - ложный "0 событий", а не сбой.
-#   Чтобы не зависеть от формата и языка текста события (путь и сопровождающие слова могут быть локализованы
-#   по-разному), сам хэш в сообщении ищется так: все символы, кроме шестнадцатеричных цифр, убираются, и
-#   проверяется, встречается ли искомый хэш (32/40/64 символа) как есть внутри получившейся строки - само
-#   шестнадцатеричное значение хэша в событии не переводится ни на одном языке.
-#   -Hash  хэш, который ищем (без разделителей, регистр не важен); -Since  с какого момента искать события
-#   (обычно дата блокировки). Возвращает объекты { Computer, Time, Id, Message } - по одному на найденное событие.
-#   Локальные: $hash - хэш в верхнем регистре; $events - все подходящие по коду и времени события; $e - текущее
-#   событие; $normalized - его текст без ничего, кроме hex-цифр.
-$script:SrpEventScript = {
-    param($Hash, $Since)
-    $hash = ([string]$Hash).ToUpper()
-    try {
-        $events = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'SRP'; Id = 865, 866, 867, 868, 882; StartTime = $Since } -ErrorAction Stop
-    }
-    catch {
-        return      # событий нет, либо журнал/источник недоступен - для вызывающего кода это одно и то же: "ничего не найдено"
-    }
-    foreach ($e in $events) {
-        $normalized = ($e.Message -replace '[^0-9A-Fa-f]', '').ToUpper()
-        if ($normalized.Contains($hash)) {
-            New-Object PSObject -Property @{
-                Computer = $env:COMPUTERNAME
-                Time     = $e.TimeCreated
-                Id       = $e.Id
-                Message  = $e.Message
-            }
-        }
-    }
-}
-
-# Start-SrpEventCheck - в фоне запускает $script:SrpEventScript на указанных компьютерах.
-#   -ComputerName  где искать; -Hash  что искать; -Since  с какого момента. Возвращает задание.
-function Start-SrpEventCheck {
-    param([Parameter(Mandatory)][string[]]$ComputerName, [Parameter(Mandatory)][string]$Hash, [Parameter(Mandatory)][datetime]$Since)
-    Invoke-Command -ComputerName $ComputerName -ScriptBlock $script:SrpEventScript -ArgumentList $Hash, $Since `
-        -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 -AsJob -JobName 'ProcMon-Events'
 }
 
 # Get-JobProgress - прогресс фонового задания: сколько компьютеров уже завершили работу. Компьютеры, отсеянные
@@ -1122,46 +932,27 @@ function Receive-JobResults {
 }
 
 # ===========================================================================
-# Блокировка по хэшу (SRP / GPO)
+# Блокировка по хэшу (без GPO) и блокировка учётной записи
 # ===========================================================================
 
-# Блокировка запуска по хэшу через Software Restriction Policies (SRP) в доменной GPO.
-# Правило пишется в Registry.pol GPO как хэш-правило уровня "Запрещено" (Disallowed):
-#   HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Hashes\{GUID}
-# Требуется модуль GroupPolicy (RSAT: Group Policy Management) на машине администратора.
+# Блокировка запуска по хэшу теперь не использует Software Restriction Policies/GPO вообще - список
+# заблокированных хэшей хранится только в данных приложения (blocks.json) и применяется мониторингом:
+# после каждого сканирования (ручного или планового) свежесобранные процессы сверяются с этим списком, и
+# совпавшие сразу закрываются (см. Invoke-BlockSweep). Это значит, что между запуском заблокированного файла
+# и ближайшим сканированием есть окно - в отличие от SRP, превентивной блокировки запуска здесь нет.
 
-# $script:SrpBase - раздел реестра политики SRP в Computer Configuration (действует на всех пользователей
-#   компьютера - обычный режим блокировки).
-$script:SrpBase = 'HKLM\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
-# $script:SrpBaseUser - тот же раздел, но в User Configuration (HKCU): правило действует только там, где
-#   применяется ПОЛЬЗОВАТЕЛЬСКАЯ часть GPO, то есть для того, кто вошёл в систему под нужной учётной записью,
-#   независимо от того, на каком компьютере домена он это делает. Сама по себе запись хэша в User Configuration
-#   ничего не ограничивает по пользователю - фактическое ограничение "кому" даёт Security Filtering GPO
-#   (см. Set-GpoUserFiltering): без него правило действует на всех, кого достаёт привязка GPO, точно как в
-#   Computer Configuration.
-$script:SrpBaseUser = 'HKCU\Software\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
-
-# $script:SrpHashAlg - код алгоритма хэша для значения HashAlg правила SRP (MD5=0x8003, SHA1=0x8004, SHA256=0x800C).
-$script:SrpHashAlg = @{ MD5 = 32771; SHA1 = 32772; SHA256 = 32780 }
 # $script:HashLength - сколько шестнадцатеричных символов в хэше каждого алгоритма (для проверки ввода).
 $script:HashLength = @{ MD5 = 32; SHA1 = 40; SHA256 = 64 }
 
 # $script:NotifyTemplate - текст уведомления, которое видит пользователь при закрытии заблокированного файла
-#   (имя файла подставляется вместо {0}). Объявлено здесь, а не в UI-блоке ниже, потому что используется и из
-#   Invoke-BlockSweep (см. ниже), которая должна работать и в режиме -ScheduledScan - там код до UI-блока
-#   вообще не доходит (скрипт завершается раньше, см. "if ($ScheduledScan) {...; exit}").
+#   (имя файла подставляется вместо {0}) - для обычной блокировки, без блокировки учётной записи.
+# $script:LockNotifyTemplate - то же самое, но для блокировки с LockAccount=1: дополнительно сообщает, что
+#   учётная запись будет заблокирована и для разблокировки нужно обратиться к системному администратору.
+# Объявлены здесь, а не в UI-блоке ниже, потому что используются и из Invoke-BlockSweep, которая должна
+# работать и в режиме -ScheduledScan - там код до UI-блока вообще не доходит (скрипт завершается раньше,
+# см. "if ($ScheduledScan) {...; exit}").
 $script:NotifyTemplate = 'Нельзя такое запускать: «{0}» заблокировано политикой безопасности.'
-
-# $script:SrpExecutableTypes - расширения файлов, которые SRP проверяет (записываются в GPO один раз вместе с базовыми настройками).
-$script:SrpExecutableTypes = @(
-    'ADE', 'ADP', 'BAS', 'BAT', 'CHM', 'CMD', 'COM', 'CPL', 'CRT', 'EXE', 'HLP', 'HTA', 'INF', 'INS', 'ISP',
-    'LNK', 'MDB', 'MDE', 'MSC', 'MSI', 'MSP', 'MST', 'OCX', 'PCD', 'PIF', 'REG', 'SCR', 'SHS', 'URL', 'VB', 'WSC'
-)
-
-# Test-GroupPolicyModule - есть ли на этом компьютере модуль GroupPolicy (RSAT). Возвращает $true/$false.
-function Test-GroupPolicyModule {
-    [bool](Get-Module -ListAvailable -Name GroupPolicy)
-}
+$script:LockNotifyTemplate = 'Нельзя использовать «{0}» - это запрещено политикой безопасности. Ваша учётная запись будет заблокирована. Для разблокировки обратитесь к системному администратору.'
 
 # Test-ProtectedPath - защита от самоубийства домена: возвращает $true, если файл лежит в X:\Windows\...
 #   Блокировка по хэшу svchost.exe или explorer.exe остановила бы все компьютеры, поэтому такие файлы
@@ -1172,197 +963,12 @@ function Test-ProtectedPath {
     return [bool]($Path -match '(?i)^[a-z]:\\windows\\')
 }
 
-# ConvertFrom-HexString - превращает строку "DEADBEEF" в массив байт (нужен для записи хэша в реестр).
-#   -Hex  строка из шестнадцатеричных символов чётной длины. $bytes - результат.
-function ConvertFrom-HexString {
-    param([Parameter(Mandatory)][string]$Hex)
-    $bytes = New-Object byte[] ($Hex.Length / 2)
-    for ($i = 0; $i -lt $bytes.Length; $i++) {
-        $bytes[$i] = [Convert]::ToByte($Hex.Substring($i * 2, 2), 16)
-    }
-    , $bytes
-}
-
 # Test-HashValue - проверяет, что строка является корректным хэшем: только hex-символы и длина
 #   соответствует алгоритму (MD5 - 32, SHA1 - 40, SHA256 - 64). Возвращает $true/$false.
 function Test-HashValue {
     param([string]$Algorithm, [string]$Hash)
     return [bool]($Hash -match '^[0-9A-Fa-f]+$' -and $Hash.Length -eq $script:HashLength[$Algorithm])
 }
-
-# Set-GpoUserFiltering - настраивает Security Filtering GPO так, чтобы она (и записанные в неё правила User
-#   Configuration) применялась ТОЛЬКО к указанному пользователю/группе, а не ко всем ("Authenticated Users",
-#   которых New-GPO ставит по умолчанию). Без этого шага блокировка "по пользователю" на деле действовала бы
-#   на всех, кто попадает под привязку GPO - ровно как обычная, компьютерная. -GpoName  имя GPO;
-#   -PrincipalSam  sAMAccountName пользователя/группы; -PrincipalType  'User' или 'Group'.
-#   Идемпотентна: повторный вызов для уже настроенной GPO ничего не меняет.
-#   Локальные: $current - текущие права GPO; $hasApply - есть ли уже GpoApply у этого principal;
-#   $authUsersApply - есть ли ещё права на Apply у "Authenticated Users" (их нужно снять).
-function Set-GpoUserFiltering {
-    param(
-        [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$PrincipalSam,
-        [Parameter(Mandatory)][ValidateSet('User', 'Group')][string]$PrincipalType
-    )
-    $current = @(Get-GPPermission -Name $GpoName -All -ErrorAction Stop)
-    $hasApply = $current | Where-Object { $_.Trustee.Name -eq $PrincipalSam -and $_.Permission -eq 'GpoApply' }
-    if (-not $hasApply) {
-        [void](Set-GPPermission -Name $GpoName -TargetName $PrincipalSam -TargetType $PrincipalType -PermissionLevel GpoApply -ErrorAction Stop)
-    }
-    $authUsersApply = $current | Where-Object { $_.Trustee.Name -eq 'Authenticated Users' -and $_.Permission -eq 'GpoApply' }
-    if ($authUsersApply) {
-        [void](Set-GPPermission -Name $GpoName -TargetName 'Authenticated Users' -TargetType Group -PermissionLevel None -ErrorAction Stop)
-    }
-}
-
-# Initialize-SrpGpo - готовит GPO к хранению правил: создаёт её, если нет; записывает базовые параметры
-#   SRP (если их ещё нет - существующие не перезаписываются); при необходимости привязывает к OU/домену;
-#   если задан -PrincipalSam - ограничивает действие GPO только этим пользователем/группой (Set-GpoUserFiltering).
-#   -GpoName  имя GPO; -LinkTarget  DN контейнера для привязки (пусто - не привязывать); -Scope  'Computer'
-#   (по умолчанию) или 'User' - базовые настройки SRP пишутся ТОЛЬКО в этот раздел (Computer или User
-#   Configuration), а не в оба сразу: у каждой GPO, которую создаёт это приложение, только ОДНО назначение
-#   (компьютерная блокировка - свои GPO с базовым именем; блокировка по пользователю/группе - свои отдельные
-#   GPO с суффиксом, см. Resolve-BlockTarget), поэтому второй раздел такой GPO никогда не использовался бы, и
-#   писать туда пустую, бесполезную конфигурацию SRP (DefaultLevel/PolicyScope и т. п. без единого правила)
-#   незачем - раньше это делалось, пока не выяснилось, что GPMC начинает отказываться строить отчёт "Параметры"
-#   для такой GPO ("Ссылка на объект не указывает на экземпляр объекта").
-#   -PrincipalSam/-PrincipalType  см. Set-GpoUserFiltering (пусто - фильтрация не трогается, GPO действует на
-#   всех, как обычная компьютерная блокировка). Возвращает GPO.
-#   Локальные: $gpo - объект GPO; $base - раздел реестра (Computer или User, по -Scope); $hasBase - есть ли в
-#   GPO базовые настройки SRP в этом разделе; $linked - уже привязана ли GPO к контейнеру.
-#   Базовые значения: DefaultLevel=262144 ("Неограниченный": всё, что не запрещено, работает), TransparentEnabled=1,
-#   PolicyScope=0 (все пользователи), AuthenticodeEnabled=0, ExecutableTypes (список расширений).
-function Initialize-SrpGpo {
-    param(
-        [Parameter(Mandatory)][string]$GpoName,
-        [string]$LinkTarget,
-        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
-        [string]$PrincipalSam,
-        # Без ValidateSet: параметр необязательный, и при вызове без -PrincipalSam сюда часто передают пустую
-        # строку явно (например, Add-SrpHashBlock всегда передаёт своё $PrincipalType дальше) - ValidateSet
-        # отверг бы такой явный пустой вызов, хотя он корректен (значит "фильтрация не нужна"). Проверка набора
-        # 'User'/'Group' в любом случае происходит там, где это по-настоящему важно - в Set-GpoUserFiltering,
-        # куда $PrincipalType передаётся только если задан $PrincipalSam.
-        [string]$PrincipalType
-    )
-    Import-Module GroupPolicy -ErrorAction Stop
-
-    $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
-    if (-not $gpo) {
-        $gpo = New-GPO -Name $GpoName -Comment 'Блокировка процессов по хэшу (создано ProcessMonitor)' -ErrorAction Stop
-    }
-
-    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
-    $hasBase = $true
-    try {
-        [void](Get-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -ErrorAction Stop)
-    }
-    catch {
-        $hasBase = $false
-    }
-    if (-not $hasBase) {
-        # DefaultLevel 262144 = "Неограниченный": всё, что не запрещено правилами, запускается как раньше.
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName DefaultLevel -Type DWord -Value 262144)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName TransparentEnabled -Type DWord -Value 1)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName PolicyScope -Type DWord -Value 0)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName AuthenticodeEnabled -Type DWord -Value 0)
-        [void](Set-GPRegistryValue -Name $GpoName -Key $base -ValueName ExecutableTypes -Type MultiString -Value $script:SrpExecutableTypes)
-    }
-
-    if ($LinkTarget) {
-        $linked = (Get-GPInheritance -Target $LinkTarget -ErrorAction Stop).GpoLinks |
-            Where-Object { $_.DisplayName -eq $GpoName }
-        if (-not $linked) {
-            [void](New-GPLink -Name $GpoName -Target $LinkTarget -ErrorAction Stop)
-        }
-    }
-    if ($PrincipalSam) {
-        Set-GpoUserFiltering -GpoName $GpoName -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType
-    }
-    return $gpo
-}
-
-# Add-SrpHashBlock - добавляет в GPO хэш-правило уровня "Запрещено". Возвращает GUID правила "{xxxxxxxx-...}".
-#   -GpoName, -LinkTarget, -PrincipalSam, -PrincipalType  GPO, привязка и ограничение по пользователю/группе
-#   (см. Initialize-SrpGpo); -Name  имя файла (для описания правила); -Algorithm и -Hash  хэш; -Size  размер
-#   файла (SRP сверяет и его). -Scope  'Computer' (по умолчанию - правило в Computer Configuration, действует
-#   на всех пользователей компьютера) или 'User' (правило в User Configuration этой же GPO; реально ограничивает
-#   конкретного пользователя/группу только в сочетании с -PrincipalSam - без него это просьба "для всех", только
-#   записанная в другой раздел реестра).
-#   Значения правила в реестре: ItemData (хэш в байтах), ItemSize (размер), HashAlg (алгоритм), SaferFlags=0,
-#   LastModified (дата изменения), Description (описание).
-#   Локальные: $base - раздел реестра (Computer или User, в зависимости от -Scope); $ruleId - GUID нового
-#   правила; $key - раздел реестра правила; $bytes - хэш в байтах; $description - текст описания.
-function Add-SrpHashBlock {
-    param(
-        [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][ValidateSet('MD5', 'SHA1', 'SHA256')][string]$Algorithm,
-        [Parameter(Mandatory)][string]$Hash,
-        [long]$Size,
-        [string]$LinkTarget,
-        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer',
-        [string]$PrincipalSam,
-        [string]$PrincipalType          # см. комментарий у этого же параметра в Initialize-SrpGpo - без ValidateSet
-    )
-    if (-not (Test-HashValue -Algorithm $Algorithm -Hash $Hash)) {
-        throw "Некорректный $Algorithm-хэш: '$Hash'."
-    }
-    [void](Initialize-SrpGpo -GpoName $GpoName -LinkTarget $LinkTarget -Scope $Scope -PrincipalSam $PrincipalSam -PrincipalType $PrincipalType)
-
-    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
-    $ruleId = [Guid]::NewGuid().ToString('B')
-    $key = '{0}\0\Hashes\{1}' -f $base, $ruleId
-    $bytes = ConvertFrom-HexString -Hex $Hash
-
-    $description = '{0} (добавлено ProcessMonitor {1})' -f $Name, (Get-Date).ToString('yyyy-MM-dd')
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName ItemData -Type Binary -Value $bytes)
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName ItemSize -Type QWord -Value $Size)
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName HashAlg -Type DWord -Value $script:SrpHashAlg[$Algorithm])
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName SaferFlags -Type DWord -Value 0)
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName LastModified -Type QWord -Value ([DateTime]::UtcNow.ToFileTimeUtc()))
-    [void](Set-GPRegistryValue -Name $GpoName -Key $key -ValueName Description -Type String -Value $description)
-    return $ruleId
-}
-
-# Remove-SrpHashBlock - удаляет правило из GPO по его GUID. -GpoName  имя GPO; -RuleId  GUID из журнала блокировок;
-#   -Scope  в каком разделе искать правило - 'Computer' (по умолчанию, для совместимости со старыми записями
-#   журнала, у которых поля Scope ещё не было) или 'User' (см. Add-SrpHashBlock).
-# Get-GpoLinkSummary - сколько у GPO реальных привязок (Link) к OU/домену и сколько из них включено.
-#   Читает отчёт GPO (GenerateReport) и считает узлы <LinksTo> - именно по ним gpupdate на клиенте решает,
-#   какие GPO вообще обрабатывать; DefaultLevel/Hashes внутри самой GPO не играют роли, если привязок нет.
-#   -GpoName  имя GPO. Возвращает $null, если GPO не существует или отчёт получить не удалось (нет прав,
-#   не установлен модуль и т. п.) - в этом случае вызывающий код должен считать состояние неизвестным и не
-#   делать по одной этой проверке категоричных выводов. Иначе - { Total = всего привязок, Enabled = сколько
-#   из них включено (отключённые Link ничего не применяют), Paths = их DN }.
-#   Локальные: $gpo - объект GPO; $xml - разобранный XML-отчёт; $links - узлы <LinksTo>; $enabled - из них включённые.
-function Get-GpoLinkSummary {
-    param([Parameter(Mandatory)][string]$GpoName)
-    try {
-        Import-Module GroupPolicy -ErrorAction Stop
-        $gpo = Get-GPO -Name $GpoName -ErrorAction Stop
-        $xml = [xml]$gpo.GenerateReport([Microsoft.GroupPolicy.ReportType]::Xml)
-        $links = @($xml.GPO.LinksTo | Where-Object { $_ })
-        $enabled = @($links | Where-Object { [string]$_.Enabled -eq 'true' })
-        return [pscustomobject]@{ Total = $links.Count; Enabled = $enabled.Count; Paths = @($links | ForEach-Object { [string]$_.SOMPath }) }
-    }
-    catch {
-        return $null
-    }
-}
-
-function Remove-SrpHashBlock {
-    param(
-        [Parameter(Mandatory)][string]$GpoName,
-        [Parameter(Mandatory)][string]$RuleId,
-        [ValidateSet('Computer', 'User')][string]$Scope = 'Computer'
-    )
-    Import-Module GroupPolicy -ErrorAction Stop
-    $base = if ($Scope -eq 'User') { $script:SrpBaseUser } else { $script:SrpBase }
-    $key = '{0}\0\Hashes\{1}' -f $base, $RuleId
-    [void](Remove-GPRegistryValue -Name $GpoName -Key $key -ErrorAction Stop)
-}
-
 
 # ===========================================================================
 # Журнал в файле
@@ -1371,25 +977,39 @@ function Remove-SrpHashBlock {
 # $script:LogFile - файл журнала на диске (data\logs\processmonitor.log). Записи ДОБАВЛЯЮТСЯ в конец и не стираются
 #   при перезапуске программы; при размере больше 5 МБ файл переименовывается в processmonitor.log.1 (старый .1 заменяется).
 $script:LogFile = Join-Path $DataPath 'logs\processmonitor.log'
+# $script:AccountBlockLogFile - ОТДЕЛЬНЫЙ файл журнала, только для событий блокировки учётных записей
+#   (data\logs\account-blocks.log) - выписка из общего журнала специально для аудита этой, самой серьёзной
+#   меры: кого, когда и за что заблокировали на уровне домена. Та же ротация, что и у обычного журнала
+#   (см. Write-LogFile).
+$script:AccountBlockLogFile = Join-Path $DataPath 'logs\account-blocks.log'
 
 # Write-LogFile - дописывает сообщение в файл журнала со строкой даты и времени "гггг-мм-дд чч:мм:сс  сообщение".
-#   -Message текст; -Time время записи. Файл в UTF-8 с BOM (корректно открывается Блокнотом). Любая ошибка записи
+#   -Message текст; -Time время записи; -Path какой файл журнала (по умолчанию - основной, $script:LogFile;
+#   для аудита блокировок учётных записей передаётся $script:AccountBlockLogFile, см. Write-AccountBlockLog).
+#   Файл в UTF-8 с BOM (корректно открывается Блокнотом). Любая ошибка записи
 #   (нет прав, файл занят) молча игнорируется: журнал не должен ронять программу.
 #   Локальные: $dir - папка журнала; $info - сведения о файле (для проверки размера).
 function Write-LogFile {
-    param([string]$Message, [datetime]$Time = (Get-Date))
-    if (-not $script:LogFile) { return }
+    param([string]$Message, [datetime]$Time = (Get-Date), [string]$Path = $script:LogFile)
+    if (-not $Path) { return }
     try {
-        $dir = Split-Path -Parent $script:LogFile
+        $dir = Split-Path -Parent $Path
         if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $info = Get-Item -LiteralPath $script:LogFile -ErrorAction SilentlyContinue
-        if ($info -and $info.Length -gt 5MB) { Move-Item -LiteralPath $script:LogFile -Destination ($script:LogFile + '.1') -Force }
+        $info = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($info -and $info.Length -gt 5MB) { Move-Item -LiteralPath $Path -Destination ($Path + '.1') -Force }
         $line = '{0}  {1}{2}' -f $Time.ToString('yyyy-MM-dd HH:mm:ss'), $Message, [Environment]::NewLine
-        [System.IO.File]::AppendAllText($script:LogFile, $line, (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::AppendAllText($Path, $line, (New-Object System.Text.UTF8Encoding($true)))
     }
     catch {
         # ничего: журнал вспомогательный
     }
+}
+
+# Write-AccountBlockLog - дописывает строку в ОТДЕЛЬНЫЙ файл журнала блокировок учётных записей
+#   ($script:AccountBlockLogFile) - тонкая обёртка над Write-LogFile с другим файлом по умолчанию.
+function Write-AccountBlockLog {
+    param([string]$Message, [datetime]$Time = (Get-Date))
+    Write-LogFile -Message $Message -Time $Time -Path $script:AccountBlockLogFile
 }
 
 # ===========================================================================
@@ -1478,7 +1098,6 @@ function Invoke-SelfTest {
         Assert-True (-not (Test-HashValue -Algorithm MD5 -Hash ('G' * 32))) 'не-hex хэш должен отклоняться'
         Assert-True (Test-ProtectedPath -Path 'C:\Windows\System32\svchost.exe') 'каталог Windows должен быть защищён'
         Assert-True (-not (Test-ProtectedPath -Path 'C:\Program Files\App\a.exe')) 'Program Files не должен быть защищён'
-        Assert-True ((ConvertFrom-HexString -Hex 'DEADBEEF').Length -eq 4) 'ConvertFrom-HexString вернул не 4 байта'
     }
     Test-Step 'JSON-хранилище (сканирования, процессы, блокировки, кириллица, перезагрузка с диска)' {
         $tmp = Join-Path ([IO.Path]::GetTempPath()) ('pm-selftest-' + [Guid]::NewGuid().ToString('N'))
@@ -1490,7 +1109,7 @@ function Invoke-SelfTest {
             )
             $scan = New-Scan -Requested 3
             Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested 3 -Rows $rows -Succeeded 2 -Failed 1
-            Add-BlockRecord -Name 'тест.exe' -Algorithm MD5 -Hash 'aa' -Size 5GB -GpoName 'G' -RuleId '{1}'
+            Add-BlockRecord -Name 'тест.exe' -Algorithm MD5 -Hash 'aa' -Size 5GB
 
             $script:Scans = $null; $script:Blocks = $null
             Initialize-Database -Path $tmp                       # заново читаем всё с диска
@@ -1541,9 +1160,6 @@ function Invoke-SelfTest {
         $grid = New-Object System.Windows.Forms.DataGridView
         $form.Controls.Add($grid)
         $form.Dispose()
-    }
-    Test-Step 'Модуль GroupPolicy (RSAT) - нужен для блокировки' -Optional {
-        Assert-True (Test-GroupPolicyModule) 'модуль не найден; установите Group Policy Management (RSAT)'
     }
     Test-Step 'Запрос списка компьютеров из AD' -Optional {
         $found = @(Get-AdComputers | Select-Object -First 5)
@@ -1611,15 +1227,36 @@ function Invoke-ScheduledScan {
     return 0
 }
 
+# Invoke-AccountLockFollowUp - общая обработка результата Start-BlockApply в части блокировки учётных записей -
+#   используется и из UI (Complete-BlockApply), и из headless-sweep (Invoke-BlockSweep в режиме -ScheduledScan).
+#   Для каждого владельца из UsersToLock (см. $script:ApplyBlockScript) КАЖДОГО компьютера в результате:
+#   отключает его учётную запись в AD (Disable-AdAccount - делается здесь, на машине администратора, а не на
+#   удалённом компьютере, где выполнялся сам $script:ApplyBlockScript - см. там же, почему) и пишет исход в
+#   отдельный журнал блокировок учётных записей (Write-AccountBlockLog).
+#   -Result  итог Receive-JobResults. -BlockLabel  текст для журнала (имя файла и хэш - "'bad.exe' (MD5 ...)").
+#   Ничего не возвращает - все эффекты это запись в AD и в файл журнала.
+#   Локальные: $r - результат одного компьютера; $owner - "ДОМЕН\логин"; $sam - то же без имени домена;
+#   $ok - удалось ли отключить; $status - текст для журнала.
+function Invoke-AccountLockFollowUp {
+    param([Parameter(Mandatory)]$Result, [string]$BlockLabel = '')
+    foreach ($r in $Result.Data) {
+        foreach ($owner in @($r.UsersToLock)) {
+            $sam = $owner
+            $slash = $owner.LastIndexOf('\')
+            if ($slash -ge 0) { $sam = $owner.Substring($slash + 1) }
+            $ok = Disable-AdAccount -Sam $sam
+            $status = if ($ok) { 'учётная запись отключена' } else { 'НЕ УДАЛОСЬ отключить учётную запись (нет прав или учётная запись не найдена)' }
+            Write-AccountBlockLog -Message ("Пользователь {0} (компьютер {1}{2}): {3}" -f $owner, $r.Computer, $(if ($BlockLabel) { ", файл $BlockLabel" } else { '' }), $status)
+        }
+    }
+}
+
 # Invoke-BlockSweep - "невод": после КАЖДОГО сканирования (ручного или планового) сверяет свежесобранные строки
 #   с активными блокировками (Get-BlockTable) и для каждого совпадения сразу закрывает найденные запущенные
-#   экземпляры файла - НЕ дожидаясь и вообще НЕ полагаясь на GPO/SRP (-SkipGpUpdate у Start-BlockApply):
-#   gpupdate здесь даже не вызывается. Это сознательный компромисс взамен проблем с групповой политикой на
-#   конкретном домене (см. обсуждение про "LocalGPO" в журнале) - ценой окна между запуском заблокированного
-#   файла и следующим сканированием (а не мгновенно, как настоящий SRP), зато вообще не зависит от того,
-#   работает ли GPO. Принудительное завершение сеанса сюда сознательно не входит (-LogoffSessions $false) - это
-#   сильное действие, оставлено только для явного запроса администратора при самой блокировке
-#   (Invoke-BlockSelected/-Batch), не для автоматической фоновой проверки без присмотра.
+#   экземпляры файла, уведомляет пользователя и, если для этой блокировки включено (LockAccount=1), завершает
+#   его сеанс и полностью блокирует его учётную запись в AD. Единственный механизм enforcement в приложении -
+#   никакой групповой политики нет, поэтому между запуском заблокированного файла и ближайшим сканированием
+#   есть окно (а не мгновенная блокировка, как раньше была бы через SRP).
 #   -Rows  строки свежесобранного сканирования - ровно то же, что передаётся в Save-Processes (с полями
 #   Computer/Name/Path/MD5/SHA1/SHA256 и т. д.) - проверяются только ОНИ, а не вся история, чтобы не закрывать
 #   и не уведомлять повторно по старым, уже не актуальным данным.
@@ -1631,9 +1268,10 @@ function Invoke-ScheduledScan {
 #   наблюдение таймером (Register-UiJob/Complete-BlockApply - доступны только в UI-режиме, но к моменту, когда
 #   этот код реально выполнится по нажатию кнопки, они уже определены).
 #   Локальные: $blocks - активные блокировки; $b - текущая блокировка; $algo/$hash - её алгоритм и хэш;
-#   $matches - строки сканирования с таким же хэшем; $map - "компьютер -> пути к файлу"; $notifyText - текст
-#   уведомления с именем файла; $label - текст для журнала; $job - фоновое задание закрытия; $result - его итог
-#   (только в headless-режиме, см. Receive-JobResults).
+#   $matches - строки сканирования с таким же хэшем; $map - "компьютер -> пути к файлу"; $lockAccount - включена
+#   ли для этой блокировки блокировка учётной записи; $notifyText - текст уведомления (обычный или про блокировку
+#   учётки); $label - текст для журнала; $job - фоновое задание закрытия; $result - его итог (только в
+#   headless-режиме, см. Receive-JobResults).
 function Invoke-BlockSweep {
     param([Parameter(Mandatory)][object[]]$Rows)
     if ($Rows.Count -eq 0) { return }
@@ -1653,11 +1291,14 @@ function Invoke-BlockSweep {
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             if ($map[$key] -notcontains $path) { $map[$key] += $path }
         }
-        $notifyText = $script:NotifyTemplate -f ([string]$b.Name)
+        $lockAccount = [string]$b.LockAccount -eq 'Да'
+        $notifyText = if ($lockAccount) { $script:LockNotifyTemplate -f ([string]$b.Name) } else { $script:NotifyTemplate -f ([string]$b.Name) }
         $label = "'{0}' ({1} {2})" -f $b.Name, $algo, $hash
 
+        Register-BlockHit -Id ([int]$b.Id) -Count $matches.Count
+
         try {
-            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $false -RestrictOwnerSam '' -SkipGpUpdate $true
+            $job = Start-BlockApply -Map $map -NotifyText $notifyText -LogoffSessions $lockAccount -LockAccount $lockAccount
         }
         catch {
             $msg = "После сканирования: не удалось запустить закрытие $label - $($_.Exception.Message)"
@@ -1665,7 +1306,8 @@ function Invoke-BlockSweep {
             continue
         }
 
-        $msg = "После сканирования: заблокированный файл $label обнаружен запущенным на $($map.Count) компьютер(ах) - закрываю..."
+        $consequence = if ($lockAccount) { ' - закрываю, завершаю сеанс и блокирую учётную запись...' } else { ' - закрываю...' }
+        $msg = "После сканирования: заблокированный файл $label обнаружен запущенным на $($map.Count) компьютер(ах)$consequence"
         if ($ScheduledScan) {
             Write-LogFile -Message $msg
             $null = Wait-Job -Job $job -Timeout 300
@@ -1676,10 +1318,11 @@ function Invoke-BlockSweep {
             foreach ($f in $result.Failures) {
                 Write-LogFile -Message ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
             }
+            if ($lockAccount) { Invoke-AccountLockFollowUp -Result $result -BlockLabel $label }
         }
         else {
             Write-Log $msg
-            Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
+            Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j -LockAccount $lockAccount -BlockLabel $label }.GetNewClosure()
         }
     }
 }
@@ -1963,58 +1606,34 @@ $tabProcesses.Controls.Add($procBar)
 
 # --- Вкладка "Блокировки" --------------------------------------------------
 # Вкладка "Блокировки":
-#   $blockBar - панель инструментов; $script:GpoBox - имя GPO, в которую добавляются правила (для блокировки
-#   "по пользователю/группе" - базовое имя, к нему автоматически добавляется суффикс с принципалом, см.
-#   Resolve-BlockTarget - у каждого пользователя/группы своя отдельная GPO);
-#   $script:LinkCombo - DN контейнера, к которому привязать GPO (необязательно); редактируемый выпадающий
-#   список: можно вставить/набрать DN вручную, а можно выбрать OU из списка, который загружает $btnLoadOUs
-#   (см. Import-AdOUs) - пункты показываются как "Имя OU — DN", а при блокировке используется только DN
-#   (после последнего " — " в тексте поля; если разделителя нет - весь текст считается DN, как раньше).
-#   $script:ScopeCombo - "Все пользователи компьютера" (обычная блокировка, как раньше) или "Пользователь/группа
-#   AD" - тогда правило SRP пишется в User Configuration той же GPO, а Security Filtering GPO ограничивается
-#   принципалом из $script:PrincipalCombo (см. Set-GpoUserFiltering), так что оно реально действует только на
-#   него/неё, а не на всех, кого достаёт привязка. $script:PrincipalCombo - sAMAccountName пользователя/группы;
-#   редактируемый выпадающий список, как $script:LinkCombo, заполняется $btnLoadPrincipals (Import-AdPrincipals)
-#   пунктами "sam — имя [пользователь/группа]"; включается/выключается при смене $script:ScopeCombo.
-#   На известных компьютерах (где файл встречался в последнем сканировании) блокировка автоматически: обновляет
-#   политики (gpupdate), завершает уже запущенные экземпляры файла и показывает каждому затронутому пользователю
-#   уведомление $script:NotifyTemplate (имя файла подставляется вместо {0}) - всё без отдельных флажков. Для
-#   блокировки по конкретному пользователю это закрытие тоже ограничено им (владелец процесса сверяется -
-#   см. $script:ApplyBlockScript); для группы - нет, см. предупреждение в Invoke-BlockSelected.
-#   $btnUnblock - "Снять блокировку"; $btnCheckEvents - "Проверить срабатывания" (ищет в журнале событий Windows
-#   попытки запуска заблокированного файла после даты блокировки - см. Invoke-CheckBlockEvents, там же оговорка
-#   про недоказанность кодов событий); $script:BlockGrid - таблица всех блокировок.
+#   $blockBar - панель инструментов; $script:LockAccountCheck - "Также блокировать учётную запись пользователя
+#   при обнаружении" - решается один раз на КАЖДУЮ создаваемую блокировку (состояние чекбокса читается в момент
+#   нажатия "Заблокировать по хэшу...", сохраняется в самой записи блокировки - LockAccount, см. Add-BlockRecord -
+#   и больше не меняется для неё; чтобы изменить решение для уже созданной блокировки, нужно снять её и
+#   создать заново). Если включено: при каждом обнаружении запущенным (сразу при блокировке и при каждом
+#   следующем сканировании, см. Invoke-BlockSweep) - закрытие файла, уведомление, ПРИНУДИТЕЛЬНОЕ завершение
+#   сеанса и ПОЛНОЕ отключение учётной записи пользователя в AD (см. README.md); если выключено - как раньше,
+#   только закрытие и уведомление, а завершение сеанса администратор решает каждый раз отдельным вопросом.
+#   $btnUnblock - "Снять блокировку"; $script:BlockGrid - таблица всех блокировок (Срабатываний/Последнее
+#   обнаружение - теперь считает сама проверка после сканирования, Invoke-BlockSweep, а не журнал событий
+#   Windows, как раньше у "Проверить срабатывания" - эта кнопка убрана за ненадобностью).
 $blockBar = New-Toolbar
-$script:GpoBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 260; Text = 'Process Hash Block (SRP)'; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
-$script:LinkCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 340; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
-$btnLoadOUs = New-Button 'Загрузить OU из AD' 160
-$script:ScopeCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 200; DropDownStyle = 'DropDownList'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
-[void]$script:ScopeCombo.Items.AddRange(@('Все пользователи компьютера', 'Пользователь/группа AD'))
-$script:ScopeCombo.SelectedIndex = 0
-$script:PrincipalCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 300; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)); Enabled = $false }
-$btnLoadPrincipals = New-Button 'Загрузить пользователей/группы из AD' 230
-$btnLoadPrincipals.Enabled = $false
+$script:LockAccountCheck = New-Object System.Windows.Forms.CheckBox -Property @{
+    Text = 'Также блокировать учётную запись пользователя при обнаружении'; AutoSize = $true
+    Margin = (New-Object System.Windows.Forms.Padding(8, 10, 2, 0))
+}
 $btnUnblock = New-Button 'Снять блокировку' 140
-$btnCheckEvents = New-Button 'Проверить срабатывания' 190
-$blockBar.Controls.AddRange(@((New-Label 'GPO:'), $script:GpoBox, (New-Label 'Привязать к (DN, можно выбрать из списка):'), $script:LinkCombo,
-        $btnLoadOUs, (New-Label 'Область:'), $script:ScopeCombo, (New-Label 'Пользователь/группа:'), $script:PrincipalCombo,
-        $btnLoadPrincipals, $btnUnblock, $btnCheckEvents))
-$script:ScopeCombo.Add_SelectedIndexChanged({
-        $isUser = [string]$script:ScopeCombo.SelectedItem -eq 'Пользователь/группа AD'
-        $script:PrincipalCombo.Enabled = $isUser
-        $btnLoadPrincipals.Enabled = $isUser
-    })
+$blockBar.Controls.AddRange(@($script:LockAccountCheck, $btnUnblock))
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
 Add-GridColumn $script:BlockGrid 'Имя' 'Name' 160
 Add-GridColumn $script:BlockGrid 'Алгоритм' 'Algorithm' 70
 Add-GridColumn $script:BlockGrid 'Хэш' 'Hash' 330 -Mono
-Add-GridColumn $script:BlockGrid 'Применяется к' 'Target' 160
-Add-GridColumn $script:BlockGrid 'Срабатываний' 'Occurrences' 100
-Add-GridColumn $script:BlockGrid 'Последнее срабатывание' 'LastEventTime' 150
-Add-GridColumn $script:BlockGrid 'Статус' 'Status' 80
-Add-GridColumn $script:BlockGrid 'GPO' 'GpoName' 200 -Fill
+Add-GridColumn $script:BlockGrid 'Блокировка учётной записи' 'LockAccount' 160
+Add-GridColumn $script:BlockGrid 'Срабатываний' 'EventCount' 100
+Add-GridColumn $script:BlockGrid 'Последнее обнаружение' 'LastEventTime' 150
+Add-GridColumn $script:BlockGrid 'Статус' 'Status' 100 -Fill
 
 $tabBlocks.Controls.Add($script:BlockGrid)
 $tabBlocks.Controls.Add($blockBar)
@@ -2120,89 +1739,6 @@ function Import-AdComputers {
     finally {
         $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
-}
-
-# Import-AdOUs - обработчик "Загрузить OU из AD": заполняет $script:LinkCombo списком "Имя — DN"
-#   (первый пункт - "(весь домен) — <DN домена>"), сохраняя уже введённый пользователем текст поля.
-#   $kept - текст поля до обновления (чтобы не сбрасывать то, что уже набрано/выбрано); $ous - полученные OU.
-function Import-AdOUs {
-    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    try {
-        Set-Status 'Запрос списка подразделений (OU) из AD...'
-        $kept = $script:LinkCombo.Text
-        $ous = @(Get-AdOrganizationalUnits)
-        $script:LinkCombo.Items.Clear()
-        foreach ($ou in $ous) { [void]$script:LinkCombo.Items.Add(('{0} — {1}' -f $ou.Name, $ou.Dn)) }      # внешние скобки обязательны: внутри .Add(...) запятая разделяет аргументы метода, а не части -f
-        $script:LinkCombo.Text = $kept
-        Write-Log "Из AD получено подразделений (OU): $($ous.Count - 1)"
-        Set-Status "Из AD получено подразделений (OU): $($ous.Count - 1)"
-    }
-    catch {
-        Write-Log "Ошибка запроса OU из AD: $($_.Exception.Message)"
-        Show-Message -Text "Не удалось получить список OU из AD:`n$($_.Exception.Message)" -Icon Error
-        Set-Status 'Ошибка запроса OU из AD'
-    }
-    finally {
-        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
-    }
-}
-
-# ConvertTo-LinkTargetDn - достаёт DN из текста поля "Привязать к". Если выбран пункт списка (есть " — "),
-#   возвращает часть после ПОСЛЕДНЕГО " — " (имя OU не экранируется и теоретически может содержать такую же
-#   подстроку, поэтому берём последнее вхождение - сам DN её в норме не содержит). Иначе считает весь текст
-#   DN, набранным или вставленным вручную, как было до появления списка. -Text содержимое поля.
-function ConvertTo-LinkTargetDn {
-    param([string]$Text)
-    $Text = $Text.Trim()
-    $sep = $Text.LastIndexOf(' — ')
-    if ($sep -ge 0) { return $Text.Substring($sep + 3).Trim() }
-    return $Text
-}
-
-# Import-AdPrincipals - обработчик "Загрузить пользователей/группы из AD": заполняет $script:PrincipalCombo
-#   списком "sam — отображаемое имя [пользователь|группа]", сохраняя уже введённый пользователем текст поля.
-#   $kept - текст поля до обновления; $items - полученные пользователи и группы (см. Get-AdUsersAndGroups).
-function Import-AdPrincipals {
-    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    try {
-        Set-Status 'Запрос пользователей и групп из AD...'
-        $kept = $script:PrincipalCombo.Text
-        $items = @(Get-AdUsersAndGroups)
-        $script:PrincipalCombo.Items.Clear()
-        foreach ($p in $items) {
-            $typeLabel = if ($p.Type -eq 'Group') { 'группа' } else { 'пользователь' }
-            [void]$script:PrincipalCombo.Items.Add(('{0} — {1} [{2}]' -f $p.Sam, $p.Display, $typeLabel))
-        }
-        $script:PrincipalCombo.Text = $kept
-        Write-Log "Из AD получено пользователей и групп: $($items.Count)"
-        Set-Status "Из AD получено пользователей и групп: $($items.Count)"
-    }
-    catch {
-        Write-Log "Ошибка запроса пользователей/групп из AD: $($_.Exception.Message)"
-        Show-Message -Text "Не удалось получить список пользователей и групп из AD:`n$($_.Exception.Message)" -Icon Error
-        Set-Status 'Ошибка запроса пользователей/групп из AD'
-    }
-    finally {
-        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
-    }
-}
-
-# ConvertTo-PrincipalInfo - разбирает текст поля "Пользователь/группа" на sAMAccountName и тип.
-#   Если текст выбран из списка (формат "sam — имя [пользователь]" или "... [группа]", см. Import-AdPrincipals) -
-#   оба значения известны сразу, без обращения к AD. Если текст набран вручную (просто sam, без " — " и
-#   "[...]") - Type возвращается $null, и вызывающий код должен сам определить тип (Resolve-AdPrincipalType)
-#   перед тем, как писать правило в GPO. -Text содержимое поля.
-function ConvertTo-PrincipalInfo {
-    param([string]$Text)
-    $Text = $Text.Trim()
-    $type = $null
-    if ($Text -match '\[(пользователь|группа)\]\s*$') {
-        $type = if ($matches[1] -eq 'группа') { 'Group' } else { 'User' }
-        $Text = $Text.Substring(0, $Text.Length - $matches[0].Length).TrimEnd()
-    }
-    $sep = $Text.IndexOf(' — ')
-    $sam = if ($sep -ge 0) { $Text.Substring(0, $sep).Trim() } else { $Text }
-    [pscustomobject]@{ Sam = $sam; Type = $type }
 }
 
 # ---------------------------------------------------------------------------
@@ -2375,76 +1911,21 @@ function Update-BlockGrid {
     $script:BlockGrid.DataSource = (Get-BlockTable).DefaultView
 }
 
-# Resolve-BlockTarget - читает элементы управления "Область" ($script:ScopeCombo) и "Пользователь/группа"
-#   ($script:PrincipalCombo) и возвращает, для кого ставится блокировка: вся машина (по умолчанию) или
-#   конкретный пользователь/группа AD. Используется и в Invoke-BlockSelected, и в Invoke-BlockSelectedBatch -
-#   поля на вкладке "Блокировки" общие для всего приложения, как GPO и привязка.
-#   -BaseGpoName  имя GPO из поля "GPO" (для компьютерной блокировки используется как есть; для блокировки
-#   по пользователю/группе к нему добавляется суффикс с именем принципала - у каждого пользователя/группы
-#   своя отдельная GPO, см. Set-GpoUserFiltering, иначе Security Filtering одной GPO ограничивала бы
-#   действие сразу всех её правил одним и тем же набором людей).
-#   Возвращает { Scope = 'Computer'/'User'; PrincipalSam; PrincipalType; Target (текст для журнала/таблицы);
-#   GpoName (реальное имя GPO для Add-SrpHashBlock/Get-GpoLinkSummary) } или $null, если выбран режим
-#   "Пользователь/группа", но поле не заполнено или тип принципала не определён - в этом случае сообщение
-#   уже показано (Show-Message), вызывающий код должен просто остановиться (return).
-#   Локальные: $scopeSelected - выбранный пункт $script:ScopeCombo; $text - текст поля принципала;
-#   $info - разбор текста (ConvertTo-PrincipalInfo); $type - его тип (из текста или Resolve-AdPrincipalType);
-#   $typeLabel - "Пользователь"/"Группа" для отображения.
-function Resolve-BlockTarget {
-    param([Parameter(Mandatory)][string]$BaseGpoName)
-
-    $scopeSelected = [string]$script:ScopeCombo.SelectedItem
-    if ($scopeSelected -ne 'Пользователь/группа AD') {
-        return [pscustomobject]@{
-            Scope = 'Computer'; PrincipalSam = ''; PrincipalType = $null
-            Target = 'Все пользователи компьютера'; GpoName = $BaseGpoName
-        }
-    }
-
-    $text = $script:PrincipalCombo.Text.Trim()
-    if (-not $text) {
-        Show-Message -Icon Warning -Text ('Укажите пользователя или группу в поле "Пользователь/группа", или ' +
-            'выберите в поле "Область" пункт "Все пользователи компьютера".')
-        return $null
-    }
-    $info = ConvertTo-PrincipalInfo -Text $text
-    $type = $info.Type
-    if (-not $type) { $type = Resolve-AdPrincipalType -Sam $info.Sam }
-    if (-not $type) {
-        Show-Message -Icon Error -Text (
-            "Не удалось определить, пользователь это или группа: `"$($info.Sam)`".`n`n" +
-            'Нажмите "Загрузить пользователей/группы из AD" и выберите нужную запись из списка, либо проверьте правильность имени.'
-        )
-        return $null
-    }
-    $typeLabel = if ($type -eq 'Group') { 'Группа' } else { 'Пользователь' }
-    [pscustomobject]@{
-        Scope         = 'User'
-        PrincipalSam  = $info.Sam
-        PrincipalType = $type
-        Target        = "${typeLabel}: $($info.Sam)"
-        GpoName       = "$BaseGpoName - ${typeLabel}: $($info.Sam)"
-    }
-}
-
 # Invoke-BlockSelected - обработчик "Заблокировать по хэшу...". Порядок действий:
-#   1) проверки (выбрана строка, указана GPO, хэш корректен, файл не в Windows\, есть модуль GroupPolicy,
-#      блокировка ещё не действует); 1а) если у GPO нет ни одной включённой привязки (Link) и поле "Привязать
-#      к" пустое - отдельное предупреждение ДО основного подтверждения: без привязки правило не подействует
-#      нигде, как бы часто ни выполнялся gpupdate; 2) окно подтверждения; 3) правило добавляется в GPO и в
-#      журнал (с тем же предупреждением, если оно относится к этому разу); 4) на всех компьютерах, где файл
-#      встречался в последнем сканировании, АВТОМАТИЧЕСКИ, без отдельных флажков: обновляются политики (gpupdate
-#      - правило SRP действует немедленно, а не после планового обновления, по умолчанию до 90 минут),
-#      завершаются уже запущенные экземпляры файла, а их пользователям показывается уведомление ($script:NotifyTemplate).
+#   1) проверки (выбрана строка, хэш корректен, файл не в Windows\, блокировка ещё не действует);
+#   2) окно подтверждения (текст зависит от того, включена ли блокировка учётной записи - $script:LockAccountCheck);
+#   3) запись добавляется в журнал блокировок (Add-BlockRecord - никакого обращения к GPO, это просто данные
+#      приложения); 4) на всех компьютерах, где файл встречался в последнем сканировании, СРАЗУ: завершаются
+#      уже запущенные экземпляры файла, их пользователям показывается уведомление, и если включена блокировка
+#      учётной записи - принудительно завершается их сеанс и позже (Complete-BlockApply) отключается учётная
+#      запись в AD. Дальнейшее обнаружение (если кто-то запустит файл заново) - уже забота Invoke-BlockSweep
+#      после следующего сканирования, а не этой функции.
 #   Локальные: $row - выбранная строка таблицы; $algorithm / $hash / $name / $path / $size - данные файла;
-#   $gpo - имя GPO; $linkTarget - DN для привязки; $linkSummary - текущие привязки GPO (Get-GpoLinkSummary,
-#   может быть $null, если проверить не удалось); $hasEnabledLink - есть ли у GPO хоть одна включённая
-#   привязка сейчас; $willBeUnlinked - после этого раза привязки по-прежнему не будет; $locations - где хэш
-#   найден; $computerCount - на скольких компьютерах; $notifyText - готовый текст уведомления (имя файла
-#   подставлено); $message - текст подтверждения; $ruleId - GUID созданного правила; $map - "компьютер -> пути"
-#   для применения; $loc, $key - элемент и ключ при его построении; $logoffSessions - ответ администратора на
-#   отдельный вопрос про принудительное завершение сеанса (спрашивается только когда есть что завершать);
-#   $job - фоновое задание применения.
+#   $lockAccount - включена ли блокировка учётной записи (чекбокс); $locations - где хэш найден; $computerCount -
+#   на скольких компьютерах; $notifyText - готовый текст уведомления (обычный или про блокировку учётки);
+#   $message - текст подтверждения; $map - "компьютер -> пути" для применения; $loc, $key - элемент и ключ при
+#   его построении; $logoffSessions - завершать ли сеанс (всегда true, если включена блокировка учётной записи;
+#   иначе - отдельный вопрос администратору); $job - фоновое задание применения.
 function Invoke-BlockSelected {
     if (-not $script:ProcGrid.CurrentRow -or -not $script:ProcGrid.CurrentRow.DataBoundItem) {
         Show-Message -Text 'Выберите строку с процессом в таблице.' -Icon Warning
@@ -2457,13 +1938,7 @@ function Invoke-BlockSelected {
     $path = [string]$row['Path']
     $size = 0L
     if ($row['Size'] -isnot [DBNull]) { $size = [long]$row['Size'] }
-    $gpoBase = $script:GpoBox.Text.Trim()
-    $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
 
-    if (-not $gpoBase) {
-        Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
-        return
-    }
     if (-not (Test-HashValue -Algorithm $algorithm -Hash $hash)) {
         Show-Message -Text "У выбранной записи нет корректного $algorithm-хэша." -Icon Warning
         return
@@ -2472,174 +1947,127 @@ function Invoke-BlockSelected {
         Show-Message -Icon Error -Text ("Файл находится в каталоге Windows:`n{0}`n`nБлокировка системных файлов по хэшу может вывести из строя все компьютеры домена, поэтому она запрещена." -f $path)
         return
     }
-    if (-not (Test-GroupPolicyModule)) {
-        Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy. Установите на этом компьютере компонент "Group Policy Management" (RSAT).'
-        return
-    }
     if (Get-ActiveBlock -Algorithm $algorithm -Hash $hash) {
         Show-Message -Text 'Для этого хэша блокировка уже активна (см. вкладку "Блокировки").'
         return
     }
-    $target = Resolve-BlockTarget -BaseGpoName $gpoBase
-    if (-not $target) { return }
-    $gpo = $target.GpoName
 
-    # Привязка (Link) GPO к OU/домену - то, от чего реально зависит, подействует ли правило: без привязки
-    # gpupdate на клиенте даже не возьмёт эту GPO в обработку, сколько бы хэшей в ней ни было добавлено.
-    # $linkSummary = $null значит "не удалось проверить" (например, GPO ещё не существует - тогда будет
-    # создана без привязки, если не задано -LinkTarget); $willBeUnlinked - после этого вызова привязки не будет.
-    $linkSummary = Get-GpoLinkSummary -GpoName $gpo
-    $hasEnabledLink = $linkSummary -and $linkSummary.Enabled -gt 0
-    $willBeUnlinked = -not $hasEnabledLink -and -not $linkTarget
-    if ($willBeUnlinked) {
-        Show-Message -Title 'GPO не привязана' -Icon Warning -Text (
-            "ВНИМАНИЕ: у GPO `"$gpo`" сейчас нет ни одной включённой привязки (Link) к OU или домену, и поле " +
-            "`"Привязать к`" не заполнено.`n`n" +
-            "Без привязки правило SRP НЕ ПОДЕЙСТВУЕТ ни на одном компьютере, сколько бы раз ни выполнялся gpupdate - " +
-            "клиент просто не станет обрабатывать эту GPO.`n`n" +
-            "Чтобы правило заработало: либо укажите DN нужного OU/домена в поле `"Привязать к`" на этой вкладке и " +
-            "заблокируйте ещё раз, либо привяжите GPO вручную в GPMC (ПКМ по OU -> Link an Existing GPO)."
-        )
-    }
-
+    $lockAccount = $script:LockAccountCheck.Checked
     $locations = Get-HashLocations -Algorithm $algorithm -Hash $hash
     $computerCount = @($locations.Rows | ForEach-Object { $_.Computer } | Select-Object -Unique).Count
-    $notifyText = $script:NotifyTemplate -f $name
-    $message = "Заблокировать запуск файла по хэшу?`n`nИмя: $name`n${algorithm}: $hash`nРазмер: $size байт`nПример пути: $path`nНайден на компьютерах (последнее сканирование): $computerCount`n`nПрименяется к: $($target.Target)`nGPO: $gpo"
-    if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
-    else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
-    if ($computerCount -gt 0) {
-        $message += "`n`nНа этих компьютерах сразу после добавления правила: обновятся политики (gpupdate), будут" +
-            " закрыты уже запущенные экземпляры файла, а их пользователям будет показано сообщение:`n`"$notifyText`""
-        if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'Group') {
-            $message += "`n`nЗакрытие коснётся ВСЕХ, кто сейчас запустил этот файл, а не только членов группы " +
-                "`"$($target.PrincipalSam)`" - проверить членство в группе при немедленном завершении приложение не " +
-                "умеет. Сама блокировка новых запусков при этом действует правильно - только на членов группы."
-        }
+    $notifyText = if ($lockAccount) { $script:LockNotifyTemplate -f $name } else { $script:NotifyTemplate -f $name }
+
+    $message = "Заблокировать запуск файла по хэшу?`n`nИмя: $name`n${algorithm}: $hash`nРазмер: $size байт`nПример пути: $path`nНайден на компьютерах (последнее сканирование): $computerCount"
+    if ($lockAccount) {
+        $message += "`n`nПРИ ОБНАРУЖЕНИИ ЗАПУЩЕННЫМ (сейчас и при каждом следующем сканировании): файл будет " +
+            "закрыт, пользователю показано уведомление, его сеанс немедленно завершён, а учётная запись ПОЛНОСТЬЮ " +
+            "ОТКЛЮЧЕНА в домене - для возврата доступа потребуется обращение к системному администратору."
+    }
+    elseif ($computerCount -gt 0) {
+        $message += "`n`nНа этих компьютерах сразу после добавления блокировки файл будет закрыт, а пользователю " +
+            "показано уведомление:`n`"$notifyText`""
     }
     if (-not (Confirm-Action -Text $message -Title 'Блокировка по хэшу')) { return }
 
-    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
-        $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LinkTarget $linkTarget `
-            -Scope $target.Scope -PrincipalSam $target.PrincipalSam -PrincipalType $target.PrincipalType
-        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -GpoName $gpo -RuleId $ruleId -Scope $target.Scope -Target $target.Target
-        Write-Log "Блокировка добавлена: $name ($algorithm $hash), применяется к: $($target.Target), GPO '$gpo', правило $ruleId"
-        if ($willBeUnlinked) {
-            Write-Log "ВНИМАНИЕ: GPO '$gpo' не привязана ни к одному OU/домену - блокировка НЕ действует, пока вы её не привяжете (поле `"Привязать к`" или вручную в GPMC)."
-        }
+        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LockAccount $lockAccount
+        Write-Log "Блокировка добавлена: $name ($algorithm $hash)$(if ($lockAccount) { ' [с блокировкой учётной записи]' })"
         Update-BlockGrid
     }
     catch {
         Write-Log "Ошибка блокировки: $($_.Exception.Message)"
-        Show-Message -Text "Не удалось добавить правило в GPO:`n$($_.Exception.Message)" -Icon Error
+        Show-Message -Text "Не удалось добавить блокировку:`n$($_.Exception.Message)" -Icon Error
         return
-    }
-    finally {
-        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
 
     if ($locations.Rows.Count -gt 0) {
-        # Отдельный вопрос про завершение сеанса - более серьёзное действие, чем закрытие одного процесса
-        # (закрывает ВСЕ программы пользователя на этом компьютере), поэтому спрашивается явно каждый раз,
-        # с ответом "Нет" по умолчанию (см. Confirm-Action).
-        $logoffSessions = Confirm-Action -Title 'Завершение сеанса пользователя' -Text (
-            "Процесс будет закрыт на найденных компьютерах. Нужно ли дополнительно принудительно завершить сеанс " +
-            "пользователя(ей), у которых он был открыт (в целях безопасности и предотвращения нарушений)?`n`n" +
-            "Это закроет ВСЕ открытые у них программы на этом компьютере, а не только заблокированный файл, и они " +
-            "будут немедленно отключены от сеанса."
-        )
+        # Блокировка учётной записи сама подразумевает завершение сеанса (нет смысла отключать учётную запись,
+        # оставляя пользователя в уже открытом сеансе) - отдельный вопрос про завершение сеанса задаётся, только
+        # если учётная запись НЕ блокируется; ответ по умолчанию "Нет" (см. Confirm-Action), так как это
+        # закрывает ВСЕ программы пользователя на этом компьютере, а не только заблокированный файл.
+        $logoffSessions = $lockAccount
+        if (-not $lockAccount) {
+            $logoffSessions = Confirm-Action -Title 'Завершение сеанса пользователя' -Text (
+                "Процесс будет закрыт на найденных компьютерах. Нужно ли дополнительно принудительно завершить сеанс " +
+                "пользователя(ей), у которых он был открыт (в целях безопасности и предотвращения нарушений)?`n`n" +
+                "Это закроет ВСЕ открытые у них программы на этом компьютере, а не только заблокированный файл, и они " +
+                "будут немедленно отключены от сеанса."
+            )
+        }
         $map = @{}
         foreach ($loc in $locations.Rows) {
             $key = ([string]$loc.Computer).ToUpper()
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             $map[$key] += [string]$loc.Path
         }
-        $restrictOwnerSam = if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'User') { $target.PrincipalSam } else { '' }
-        $action = 'gpupdate + завершение процессов + уведомление'
+        $blockId = [int](Get-ActiveBlock -Algorithm $algorithm -Hash $hash)['Id']
+        Register-BlockHit -Id $blockId -Count $map.Count
+        $action = 'завершение процессов + уведомление'
         if ($logoffSessions) { $action += ' + завершение сеанса' }
+        if ($lockAccount) { $action += ' + блокировка учётной записи' }
         Write-Log "Применение на $($map.Count) компьютерах ($action)..."
         Set-Status "Применение блокировки на $($map.Count) компьютерах..."
+        $label = "'$name' ($algorithm $hash)"
         try {
-            $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions -RestrictOwnerSam $restrictOwnerSam
-            Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
+            $job = Start-BlockApply -Map $map -NotifyText $notifyText -LogoffSessions $logoffSessions -LockAccount $lockAccount
+            Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j -LockAccount $lockAccount -BlockLabel $label }.GetNewClosure()
         }
         catch {
             Write-Log "Не удалось запустить применение: $($_.Exception.Message)"
         }
     }
     else {
-        Show-Message -Text 'Правило добавлено в GPO. Компьютер, на котором видели этот файл, сейчас не определён (нет данных сканирования), поэтому обновление политик не запущено - политика дойдёт до клиентов при плановом обновлении (по умолчанию до 90 минут). Пересканируйте компьютеры и повторите блокировку, чтобы обновить политики сразу.'
+        Show-Message -Text 'Блокировка добавлена. Компьютер, на котором видели этот файл, сейчас не определён (нет данных сканирования) - применится при следующем сканировании (см. "Невод" в README.md). Пересканируйте компьютеры, чтобы проверить сразу.'
     }
 }
 
-# Complete-BlockApply - вызывается по завершении обновления политик (и, если запрошено, завершения процессов):
-#   пишет в журнал по каждому компьютеру результат gpupdate, сколько запущенных экземпляров найдено и сколько
-#   реально завершено (с причиной, если завершить не удалось или завершение не запрашивалось), а также
-#   компьютеры, недоступные по WinRM. -Job завершённое задание; $result - итог (Receive-JobResults);
+# Complete-BlockApply - вызывается по завершении применения блокировки (закрытие процессов, уведомление,
+#   по желанию - завершение сеанса): пишет в журнал по каждому компьютеру результат (сколько найдено, сколько
+#   реально закрыто, сколько уведомлено), а также компьютеры, недоступные по WinRM. Если блокировка с
+#   LockAccount - дополнительно отключает учётные записи пойманных пользователей в AD (Invoke-AccountLockFollowUp).
+#   -Job завершённое задание; -LockAccount включена ли для этой блокировки блокировка учётной записи;
+#   -BlockLabel текст для журнала ("'bad.exe' (MD5 ...)"). Локальные: $result - итог (Receive-JobResults);
 #   $r - результат одного компьютера; $f - сбой.
 function Complete-BlockApply {
-    param($Job)
+    param($Job, [bool]$LockAccount = $false, [string]$BlockLabel = '')
     $result = Receive-JobResults -Job $Job
     foreach ($r in $result.Data) {
-        $line = "[{0}] gpupdate: {1}" -f $r.Computer, $r.GpUpdate
-        if ($r.GpUpdateOutput) { $line += " (вывод: $($r.GpUpdateOutput))" }
-        if ($r.TerminateRequested) {
-            $line += "; найдено запущенных: {0}; завершено: {1}; уведомлено пользователей: {2}" -f $r.Found, $r.Killed, $r.Notified
-            if ($r.LoggedOff -gt 0) { $line += "; завершено сеансов: {0}" -f $r.LoggedOff }
-            if ($r.Found -gt $r.Killed -and $r.FailReasons) { $line += "; не завершено из-за: $($r.FailReasons)" }
-            if ($r.Found -eq 0) { $line += ' (на момент применения процесс уже не был запущен)' }
-        }
-        elseif ($r.Found -gt 0) {
-            $line += "; найдено запущенных: {0} (завершение не запрошено)" -f $r.Found
-        }
+        $line = "[{0}] найдено запущенных: {1}; завершено: {2}; уведомлено пользователей: {3}" -f $r.Computer, $r.Found, $r.Killed, $r.Notified
+        if ($r.LoggedOff -gt 0) { $line += "; завершено сеансов: {0}" -f $r.LoggedOff }
+        if ($r.Found -gt $r.Killed -and $r.FailReasons) { $line += "; не завершено из-за: $($r.FailReasons)" }
+        if ($r.Found -eq 0) { $line += ' (на момент применения процесс уже не был запущен)' }
         if ($r.Error) { $line += "; ошибка: $($r.Error)" }
         Write-Log $line
     }
     foreach ($f in $result.Failures) {
         Write-Log ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
     }
+    if ($LockAccount) { Invoke-AccountLockFollowUp -Result $result -BlockLabel $BlockLabel }
     Set-Status ("Применение завершено: успешно {0}, ошибок {1}" -f $result.Succeeded, $result.Failures.Count)
 }
 
 # Invoke-BlockSelectedBatch - обработчик "Заблокировать по хэшу..." при выделении НЕСКОЛЬКИХ строк: для каждого
 #   уникального хэша среди них (один и тот же файл, выбранный на разных компьютерах, - это одна блокировка, не
 #   несколько) выполняет те же шаги, что Invoke-BlockSelected для одной строки, но с ОДНИМ общим подтверждением
-#   и ОДНИМ вопросом про завершение сеанса на весь пакет, а не по разу на каждый файл. GPO и привязка общие для
-#   всех (поля на вкладке "Блокировки" одни на всё приложение), поэтому предупреждение про непривязанную GPO
-#   тоже показывается один раз. Уже заблокированные, с некорректным хэшем или защищённым путём файлы молча
-#   пропускаются (перечисляются в сообщении, почему), остальные блокируются; ошибка на одном хэше не прерывает
-#   обработку остальных - каждая пишется в журнал отдельно. Применение (gpupdate/завершение/уведомление)
-#   запускается отдельным фоновым заданием на каждый файл (переиспользует Start-BlockApply без изменений), все
-#   они просто стартуют одним нажатием кнопки, а не создают одно сложное общее задание.
+#   и ОДНИМ вопросом про завершение сеанса на весь пакет, а не по разу на каждый файл. Блокировка учётной
+#   записи (чекбокс $script:LockAccountCheck) - тоже одна на весь пакет. Уже заблокированные, с некорректным
+#   хэшем или защищённым путём файлы молча пропускаются (перечисляются в сообщении, почему), остальные
+#   блокируются; ошибка на одном хэше не прерывает обработку остальных - каждая пишется в журнал отдельно.
+#   Применение (завершение/уведомление) запускается отдельным фоновым заданием на каждый файл (переиспользует
+#   Start-BlockApply без изменений), все они просто стартуют одним нажатием кнопки.
 #   -Rows  выбранные строки таблицы процессов (DataRow, как у Invoke-BlockSelected).
-#   Локальные: $algorithm - алгоритм хэша (общий, из $script:AlgoCombo); $gpo/$linkTarget - общие GPO и привязка;
+#   Локальные: $algorithm - алгоритм хэша (общий, из $script:AlgoCombo); $lockAccount - общая для пакета;
 #   $seen - хэши, уже учтённые при разборе (защита от дублей); $toBlock - файлы к блокировке (Name/Hash/Path/Size);
 #   $skipped - пропущенные файлы с причиной; $row/$hash/$name/$path/$size - разбор текущей строки;
-#   $linkSummary/$hasEnabledLink/$willBeUnlinked - то же, что в Invoke-BlockSelected, проверяется один раз;
 #   $message - текст общего подтверждения; $anyLocations - есть ли смысл спрашивать про завершение сеанса;
 #   $logoffSessions - общий ответ про завершение сеанса; $blocked - сколько файлов реально заблокировано;
-#   $item - текущий файл из $toBlock; $ruleId - GUID созданного правила; $locations/$map/$loc/$key/$notifyText/$job -
+#   $item - текущий файл из $toBlock; $locations/$map/$loc/$key/$notifyText/$label/$job -
 #   то же самое, что в Invoke-BlockSelected, но внутри цикла по каждому файлу из $toBlock.
 function Invoke-BlockSelectedBatch {
     param([Parameter(Mandatory)][object[]]$Rows)
 
     $algorithm = [string]$script:AlgoCombo.SelectedItem
-    $gpoBase = $script:GpoBox.Text.Trim()
-    $linkTarget = ConvertTo-LinkTargetDn -Text $script:LinkCombo.Text
-
-    if (-not $gpoBase) {
-        Show-Message -Text 'Укажите имя GPO на вкладке "Блокировки".' -Icon Warning
-        return
-    }
-    if (-not (Test-GroupPolicyModule)) {
-        Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy. Установите на этом компьютере компонент "Group Policy Management" (RSAT).'
-        return
-    }
-    $target = Resolve-BlockTarget -BaseGpoName $gpoBase
-    if (-not $target) { return }
-    $gpo = $target.GpoName
-    $restrictOwnerSam = if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'User') { $target.PrincipalSam } else { '' }
+    $lockAccount = $script:LockAccountCheck.Checked
 
     $seen = @{}
     $toBlock = New-Object System.Collections.ArrayList
@@ -2673,32 +2101,17 @@ function Invoke-BlockSelectedBatch {
         return
     }
 
-    $linkSummary = Get-GpoLinkSummary -GpoName $gpo
-    $hasEnabledLink = $linkSummary -and $linkSummary.Enabled -gt 0
-    $willBeUnlinked = -not $hasEnabledLink -and -not $linkTarget
-    if ($willBeUnlinked) {
-        Show-Message -Title 'GPO не привязана' -Icon Warning -Text (
-            "ВНИМАНИЕ: у GPO `"$gpo`" сейчас нет ни одной включённой привязки (Link) к OU или домену, и поле " +
-            "`"Привязать к`" не заполнено.`n`n" +
-            "Без привязки ни одно из следующих правил НЕ ПОДЕЙСТВУЕТ ни на одном компьютере, сколько бы раз ни " +
-            "выполнялся gpupdate - клиент просто не станет обрабатывать эту GPO.`n`n" +
-            "Чтобы правила заработали: либо укажите DN нужного OU/домена в поле `"Привязать к`" и заблокируйте " +
-            "ещё раз, либо привяжите GPO вручную в GPMC (ПКМ по OU -> Link an Existing GPO)."
-        )
-    }
-
     $message = "Заблокировать запуск $($toBlock.Count) файлов по хэшу?`n`n" +
-        (($toBlock | ForEach-Object { "  - $($_.Name)" }) -join "`n") + "`n`nПрименяется к: $($target.Target)`nGPO: $gpo"
-    if ($linkTarget) { $message += "`nПривязка: $linkTarget" }
-    else { $message += "`nGPO будет создана/изменена; убедитесь, что она привязана к нужному OU." }
+        (($toBlock | ForEach-Object { "  - $($_.Name)" }) -join "`n")
     if ($skipped.Count -gt 0) { $message += "`n`nПропущено ($($skipped.Count)):`n" + ($skipped -join "`n") }
-    $message += "`n`nНа компьютерах, где эти файлы встречались в последнем сканировании, сразу после добавления " +
-        "правил: обновятся политики (gpupdate), будут закрыты уже запущенные экземпляры, а их пользователям " +
-        "будет показано уведомление."
-    if ($target.Scope -eq 'User' -and $target.PrincipalType -eq 'Group') {
-        $message += "`n`nЗакрытие коснётся ВСЕХ, кто сейчас запустил эти файлы, а не только членов группы " +
-            "`"$($target.PrincipalSam)`" - членство в группе при немедленном завершении не проверяется. Сама " +
-            "блокировка новых запусков действует правильно - только на членов группы."
+    if ($lockAccount) {
+        $message += "`n`nПРИ ОБНАРУЖЕНИИ ЗАПУЩЕННЫМ (сейчас и при каждом следующем сканировании): файлы будут " +
+            "закрыты, пользователям показано уведомление, их сеанс немедленно завершён, а учётные записи ПОЛНОСТЬЮ " +
+            "ОТКЛЮЧЕНЫ в домене - для возврата доступа потребуется обращение к системному администратору."
+    }
+    else {
+        $message += "`n`nНа компьютерах, где эти файлы встречались в последнем сканировании, сразу после " +
+            "добавления блокировок они будут закрыты, а пользователям показано уведомление."
     }
     if (-not (Confirm-Action -Text $message -Title "Блокировка по хэшу ($($toBlock.Count) файлов)")) { return }
 
@@ -2706,8 +2119,8 @@ function Invoke-BlockSelectedBatch {
     foreach ($item in $toBlock) {
         if ((Get-HashLocations -Algorithm $algorithm -Hash $item.Hash).Rows.Count -gt 0) { $anyLocations = $true; break }
     }
-    $logoffSessions = $false
-    if ($anyLocations) {
+    $logoffSessions = $lockAccount
+    if ($anyLocations -and -not $lockAccount) {
         $logoffSessions = Confirm-Action -Title 'Завершение сеанса пользователя' -Text (
             "Процессы будут закрыты на найденных компьютерах. Нужно ли дополнительно принудительно завершить " +
             "сеанс пользователя(ей), у которых они были открыты (в целях безопасности и предотвращения " +
@@ -2721,10 +2134,8 @@ function Invoke-BlockSelectedBatch {
     try {
         foreach ($item in $toBlock) {
             try {
-                $ruleId = Add-SrpHashBlock -GpoName $gpo -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LinkTarget $linkTarget `
-                    -Scope $target.Scope -PrincipalSam $target.PrincipalSam -PrincipalType $target.PrincipalType
-                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -GpoName $gpo -RuleId $ruleId -Scope $target.Scope -Target $target.Target
-                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash)), применяется к: $($target.Target), GPO '$gpo', правило $ruleId"
+                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LockAccount $lockAccount
+                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash))$(if ($lockAccount) { ' [с блокировкой учётной записи]' })"
                 $blocked++
             }
             catch {
@@ -2740,10 +2151,13 @@ function Invoke-BlockSelectedBatch {
                 if (-not $map.ContainsKey($key)) { $map[$key] = @() }
                 $map[$key] += [string]$loc.Path
             }
-            $notifyText = $script:NotifyTemplate -f $item.Name
+            $notifyText = if ($lockAccount) { $script:LockNotifyTemplate -f $item.Name } else { $script:NotifyTemplate -f $item.Name }
+            $label = "'$($item.Name)' ($algorithm $($item.Hash))"
+            $blockId = [int](Get-ActiveBlock -Algorithm $algorithm -Hash $item.Hash)['Id']
+            Register-BlockHit -Id $blockId -Count $map.Count
             try {
-                $job = Start-BlockApply -Map $map -TerminateProcesses $true -NotifyText $notifyText -LogoffSessions $logoffSessions -RestrictOwnerSam $restrictOwnerSam
-                Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j }
+                $job = Start-BlockApply -Map $map -NotifyText $notifyText -LogoffSessions $logoffSessions -LockAccount $lockAccount
+                Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j -LockAccount $lockAccount -BlockLabel $label }.GetNewClosure()
             }
             catch {
                 Write-Log "Не удалось запустить применение для $($item.Name): $($_.Exception.Message)"
@@ -2753,16 +2167,14 @@ function Invoke-BlockSelectedBatch {
     finally {
         $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
-    if ($willBeUnlinked -and $blocked -gt 0) {
-        Write-Log "ВНИМАНИЕ: GPO '$gpo' не привязана ни к одному OU/домену - $blocked блокировок НЕ действуют, пока вы её не привяжете."
-    }
     Update-BlockGrid
     Write-Log "Массовая блокировка завершена: добавлено $blocked из $($toBlock.Count)."
     Set-Status "Массовая блокировка: добавлено $blocked из $($toBlock.Count)."
 }
 
-# Invoke-UnblockSelected - обработчик "Снять блокировку": после подтверждения удаляет правило из GPO и
-#   помечает запись в журнале снятой. $row - выбранная блокировка; $text - текст подтверждения.
+# Invoke-UnblockSelected - обработчик "Снять блокировку": помечает запись в журнале снятой. Никакой GPO больше
+#   нет, поэтому снятие блокировки - это просто Disable-BlockRecord; после снятия Invoke-BlockSweep перестаёт
+#   реагировать на этот хэш при следующих сканированиях. $row - выбранная блокировка; $text - текст подтверждения.
 function Invoke-UnblockSelected {
     if (-not $script:BlockGrid.CurrentRow -or -not $script:BlockGrid.CurrentRow.DataBoundItem) {
         Show-Message -Text 'Выберите блокировку в таблице.' -Icon Warning
@@ -2773,98 +2185,18 @@ function Invoke-UnblockSelected {
         Show-Message -Text 'Эта блокировка уже снята.'
         return
     }
-    if (-not (Test-GroupPolicyModule)) {
-        Show-Message -Icon Error -Text 'Не найден модуль GroupPolicy (RSAT).'
-        return
-    }
-    $text = "Снять блокировку?`n`nИмя: $($row['Name'])`n$($row['Algorithm']): $($row['Hash'])`nПрименяется к: $($row['Target'])`nGPO: $($row['GpoName'])"
+    $text = "Снять блокировку?`n`nИмя: $($row['Name'])`n$($row['Algorithm']): $($row['Hash'])`nБлокировка учётной записи: $($row['LockAccount'])"
     if (-not (Confirm-Action -Text $text -Title 'Снятие блокировки')) { return }
 
-    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     try {
-        Remove-SrpHashBlock -GpoName ([string]$row['GpoName']) -RuleId ([string]$row['RuleId']) -Scope ([string]$row['Scope'])
         Disable-BlockRecord -Id ([int]$row['Id'])
         Write-Log "Блокировка снята: $($row['Name']) ($($row['Algorithm']) $($row['Hash']))"
         Update-BlockGrid
-        Show-Message -Text 'Правило удалено из GPO. Клиенты применят изменение при обновлении политик.'
     }
     catch {
         Write-Log "Ошибка снятия блокировки: $($_.Exception.Message)"
-        Show-Message -Text "Не удалось удалить правило:`n$($_.Exception.Message)" -Icon Error
+        Show-Message -Text "Не удалось снять блокировку:`n$($_.Exception.Message)" -Icon Error
     }
-    finally {
-        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
-    }
-}
-
-# Invoke-CheckBlockEvents - обработчик "Проверить срабатывания": на всех компьютерах, где хэш выбранной
-#   блокировки встречался хоть когда-нибудь (Get-HashComputersEver, не только в последнем сканировании),
-#   ищет в журнале событий Windows следы попыток его запустить после даты блокировки (Start-SrpEventCheck).
-#   Результат - в Complete-CheckBlockEvents, когда фоновое задание завершится.
-#   Важная оговорка (см. комментарий у $script:SrpEventScript): код события и имя источника - по документации,
-#   не проверены на реальном журнале; если они other на вашей версии Windows, проверка тихо покажет 0 событий.
-#   Локальные: $row - выбранная блокировка; $algorithm/$hash/$id - её данные; $since - дата блокировки
-#   (BlockDate, строка "гггг-мм-дд чч:мм:сс", парсится как обычная дата); $computers - где хэш видели;
-#   $job - фоновое задание. OnDone-обработчик собран через .GetNewClosure(), иначе $id потеряется к моменту
-#   вызова (таймер окна вызывает его из совсем другой области видимости).
-function Invoke-CheckBlockEvents {
-    if (-not $script:BlockGrid.CurrentRow -or -not $script:BlockGrid.CurrentRow.DataBoundItem) {
-        Show-Message -Text 'Выберите блокировку в таблице.' -Icon Warning
-        return
-    }
-    $row = $script:BlockGrid.CurrentRow.DataBoundItem.Row
-    $algorithm = [string]$row['Algorithm']
-    $hash = [string]$row['Hash']
-    $id = [int]$row['Id']
-    $since = [datetime]$row['BlockDate']
-
-    $computers = @(Get-HashComputersEver -Algorithm $algorithm -Hash $hash)
-    if ($computers.Count -eq 0) {
-        Show-Message -Text 'Компьютеры, где встречался этот файл, неизвестны (нет данных сканирования) - проверять нечего.'
-        return
-    }
-    Write-Log "Проверка срабатываний блокировки '$($row['Name'])' на $($computers.Count) компьютерах (с $($row['BlockDate']))..."
-    Set-Status "Проверка срабатываний на $($computers.Count) компьютерах..."
-    try {
-        $job = Start-SrpEventCheck -ComputerName $computers -Hash $hash -Since $since
-        Register-UiJob -Job $job -OnDone { param($j) Complete-CheckBlockEvents -Job $j -BlockId $id }.GetNewClosure()
-    }
-    catch {
-        Write-Log "Не удалось запустить проверку срабатываний: $($_.Exception.Message)"
-    }
-}
-
-# Complete-CheckBlockEvents - вызывается по завершении проверки срабатываний: считает общее число найденных
-#   событий и самое позднее из них, сохраняет в журнал блокировок (Update-BlockEventInfo) и обновляет таблицу.
-#   -Job завершённое задание; -BlockId номер блокировки, для которой проверяли.
-#   Локальные: $result - итог (Receive-JobResults); $events - найденные события (result.Data); $last - самое
-#   позднее время среди них; $e - текущее событие; $byComputer - для журнала, сколько событий на каком ПК.
-function Complete-CheckBlockEvents {
-    param($Job, [int]$BlockId)
-    $result = Receive-JobResults -Job $Job
-    $events = @($result.Data)
-    $last = $null
-    $byComputer = @{}
-    foreach ($e in $events) {
-        if (-not $last -or $e.Time -gt $last) { $last = $e.Time }
-        $key = [string]$e.Computer
-        if (-not $byComputer.ContainsKey($key)) { $byComputer[$key] = 0 }
-        $byComputer[$key] = $byComputer[$key] + 1
-    }
-    $lastText = if ($last) { $last.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
-    Update-BlockEventInfo -Id $BlockId -Count $events.Count -LastTime $lastText
-    Update-BlockGrid
-    if ($events.Count -gt 0) {
-        $details = ($byComputer.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ', '
-        Write-Log "Проверка срабатываний: найдено событий $($events.Count) ($details), последнее - $lastText"
-    }
-    else {
-        Write-Log 'Проверка срабатываний: попыток запуска не найдено (или они не распознаны - см. оговорку про коды событий в README).'
-    }
-    foreach ($f in $result.Failures) {
-        Write-Log ("[{0}] не удалось проверить: {1}" -f $f.Computer, $f.Message)
-    }
-    Set-Status "Проверка срабатываний завершена: найдено событий $($events.Count)"
 }
 
 # ---------------------------------------------------------------------------
@@ -2874,8 +2206,7 @@ function Complete-CheckBlockEvents {
 # Связь кнопок и действий. $i - элемент списка компьютеров; $n - имя, введённое для ручного добавления.
 #   "Остановить" останавливает $script:ScanJob; смена сканирования/алгоритма перезагружает таблицу;
 #   ввод в поле поиска фильтрует таблицу; при закрытии окна таймер и все фоновые задания останавливаются;
-#   при показе окна загружаются сканирования и блокировки, а в журнал пишется путь к папке данных и предупреждение,
-#   если нет модуля GroupPolicy.
+#   при показе окна загружаются сканирования и блокировки, а в журнал пишется путь к папке данных.
 $btnLoadAd.Add_Click({ Import-AdComputers })
 $btnAll.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $true } })
 $btnNone.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $false } })
@@ -2938,10 +2269,7 @@ $btnBlock.Add_Click({
         if ($rows.Count -gt 1) { Invoke-BlockSelectedBatch -Rows $rows }
         else { Invoke-BlockSelected }
     })
-$btnLoadOUs.Add_Click({ Import-AdOUs })
-$btnLoadPrincipals.Add_Click({ Import-AdPrincipals })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
-$btnCheckEvents.Add_Click({ Invoke-CheckBlockEvents })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
         else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
@@ -2967,9 +2295,6 @@ $script:Form.Add_Shown({
             Write-Log ('Файл скрипта: {0}, строк {1}, SHA256 {2}' -f $self, @(Get-Content -LiteralPath $self).Count, (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.Substring(0, 16))
         }
         catch { }
-        if (-not (Test-GroupPolicyModule)) {
-            Write-Log 'Внимание: модуль GroupPolicy (RSAT) не найден - блокировка будет недоступна.'
-        }
     })
 
 [void]$script:Form.ShowDialog()
