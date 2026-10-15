@@ -898,34 +898,35 @@ function Get-OnlineComputers {
     , @($online)
 }
 
-# Start-Collection - запускает сбор процессов сразу на нескольких компьютерах в фоне (Invoke-Command -AsJob),
-#   предварительно отсеяв пингом (Get-OnlineComputers) те, что сейчас выключены или недоступны по сети - на них
-#   WinRM вообще не пробуется, они сразу попадают в итоговые Failures с понятной причиной (через Receive-JobResults).
-#   -ComputerName  имена компьютеров (весь запрошенный список, включая потенциально выключенные);
-#   -ThrottleLimit  сколько компьютеров опрашивать одновременно (32).
-#   Возвращает родительское задание: по одному дочернему заданию на каждый ВКЛЮЧЁННЫЙ компьютер (у остальных
+# Start-RemoteCollection - вторая половина сбора: уже ЗНАЯ, кто онлайн/офлайн (после пинга - см. Get-OnlineComputers/
+#   Start-PingCheck), запускает Invoke-Command -AsJob только на ответивших и оформляет результат так же, как
+#   раньше делала Start-Collection. Вынесена отдельно, чтобы ею могли пользоваться и Start-Collection (пинг
+#   синхронно, для self-test и планового headless-сканирования - там нет окна, которое можно заморозить), и
+#   Complete-PingCheck (пинг уже прошёл в фоновом задании - см. его комментарий, почему это важно для
+#   интерактивного режима).
+#   -ComputerName  весь исходный список (включая офлайн, для RequestedCount); -Online/-Offline  результат пинга;
+#   -ThrottleLimit  сколько компьютеров опрашивать одновременно.
+#   Возвращает родительское задание - по одному дочернему заданию на каждый ВКЛЮЧЁННЫЙ компьютер (у остальных
 #   дочерних заданий не будет - вместо этого у возвращённого задания есть дополнительные свойства
-#   RequestedCount (весь исходный список, для подсчёта "компьютеров X из Y" на стороне вызывающего кода) и
-#   OfflineFailures (отсеянные пингом, в формате { Computer, Message }, как Failures у Receive-JobResults) -
-#   Receive-JobResults сама подмешивает их в общий список Failures, вызывающему коду ничего отдельно делать не нужно.
-#   Если пингом не ответил вообще ни один компьютер - настоящее задание всё равно создаётся (Start-Job с пустым
-#   телом), чтобы остальной конвейер (Register-UiJob, Get-JobProgress, Receive-JobResults), рассчитанный на
-#   настоящий объект задания, продолжал работать без особого случая "задания нет".
-#   Локальные: $online/$offline - включённые/выключенные по результату пинга; $offlineFailures - вторые в
-#   формате Failures; $job - создаваемое задание.
-function Start-Collection {
+#   RequestedCount и OfflineFailures (отсеянные пингом, в формате { Computer, Message }, как Failures у
+#   Receive-JobResults) - Receive-JobResults сама подмешивает их в общий список Failures, вызывающему коду
+#   ничего отдельно делать не нужно. Если онлайн компьютеров нет вообще - настоящее задание всё равно
+#   создаётся (Start-Job с пустым телом), чтобы остальной конвейер (Register-UiJob, Get-JobProgress,
+#   Receive-JobResults), рассчитанный на настоящий объект задания, продолжал работать без особого случая
+#   "задания нет". Локальные: $offlineFailures - офлайн-компьютеры в формате Failures; $job - создаваемое задание.
+function Start-RemoteCollection {
     param(
         [Parameter(Mandatory)][string[]]$ComputerName,
+        [string[]]$Online,
+        [string[]]$Offline,
         [int]$ThrottleLimit = 32
     )
-    $online = @(Get-OnlineComputers -ComputerName $ComputerName)
-    $offline = @($ComputerName | Where-Object { $online -notcontains $_ })
-    $offlineFailures = @($offline | ForEach-Object {
+    $offlineFailures = @($Offline | ForEach-Object {
             [pscustomobject]@{ Computer = $_; Message = 'не отвечает на ping (выключен или недоступен по сети)' }
         })
 
-    if ($online.Count -gt 0) {
-        $job = Invoke-Command -ComputerName $online -ScriptBlock $script:CollectScript `
+    if ($Online.Count -gt 0) {
+        $job = Invoke-Command -ComputerName $Online -ScriptBlock $script:CollectScript `
             -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
             -AsJob -JobName 'ProcMon-Collect'
     }
@@ -935,6 +936,61 @@ function Start-Collection {
     Add-Member -InputObject $job -MemberType NoteProperty -Name RequestedCount -Value $ComputerName.Count -Force
     Add-Member -InputObject $job -MemberType NoteProperty -Name OfflineFailures -Value $offlineFailures -Force
     return $job
+}
+
+# Start-Collection - запускает сбор процессов сразу на нескольких компьютерах в фоне (Invoke-Command -AsJob),
+#   предварительно отсеяв пингом (Get-OnlineComputers) те, что сейчас выключены или недоступны по сети - на них
+#   WinRM вообще не пробуется, они сразу попадают в итоговые Failures с понятной причиной (через Receive-JobResults).
+#   Пинг здесь выполняется СИНХРОННО (на вызывающем потоке) - подходит только там, где нет окна, которое можно
+#   заморозить (self-test, плановое headless-сканирование, -ScheduledScan): интерактивный режим (кнопка
+#   "Собрать процессы") использует вместо этого Start-PingCheck/Complete-PingCheck, см. их комментарии.
+#   -ComputerName  имена компьютеров (весь запрошенный список, включая потенциально выключенные);
+#   -ThrottleLimit  сколько компьютеров опрашивать одновременно (32).
+#   Локальные: $online/$offline - включённые/выключенные по результату пинга.
+function Start-Collection {
+    param(
+        [Parameter(Mandatory)][string[]]$ComputerName,
+        [int]$ThrottleLimit = 32
+    )
+    $online = @(Get-OnlineComputers -ComputerName $ComputerName)
+    $offline = @($ComputerName | Where-Object { $online -notcontains $_ })
+    return Start-RemoteCollection -ComputerName $ComputerName -Online $online -Offline $offline -ThrottleLimit $ThrottleLimit
+}
+
+# Start-PingCheck - проверяет пингом доступность компьютеров В ФОНОВОМ ЗАДАНИИ (отдельный процесс PowerShell),
+#   а не на потоке окна. Это важно: внутри Ping.SendPingAsync(имя, таймаут) разрешение имени в IP-адрес (DNS) -
+#   синхронная операция и НЕ ограничена параметром таймаута - если хотя бы один компьютер из списка не резолвится
+#   быстро (устаревшая запись, недоступный DNS-сервер и т. п.), вызов на потоке окна зависал бы на неопределённое
+#   время, а с ним и само окно (оно безотзывно занято до возврата из обработчика кнопки - ни Timer, ни отрисовка
+#   не могут сработать). Поэтому у интерактивного сбора (Start-Scan) этот шаг вынесен в Start-Job - такой же
+#   приём, как и у самого сбора процессов (Invoke-Command -AsJob), только нет готового "асинхронного" аналога
+#   у пинга, поэтому используется обычное фоновое задание.
+#   -ComputerName список имён; -TimeoutMs таймаут одного пинга (как у Get-OnlineComputers).
+#   Возвращает задание; его результат (после Receive-Job) - { Online, Offline }.
+function Start-PingCheck {
+    param([Parameter(Mandatory)][string[]]$ComputerName, [int]$TimeoutMs = 1000)
+    Start-Job -Name 'ProcMon-Ping' -ScriptBlock {
+        param($Names, $TimeoutMs)
+        $pending = foreach ($name in $Names) {
+            $ping = New-Object System.Net.NetworkInformation.Ping
+            $task = $null
+            try { $task = $ping.SendPingAsync($name, $TimeoutMs) } catch { }
+            [pscustomobject]@{ Name = $name; Ping = $ping; Task = $task }
+        }
+        $tasks = @($pending | Where-Object { $_.Task } | ForEach-Object { $_.Task })
+        if ($tasks.Count -gt 0) {
+            try { [System.Threading.Tasks.Task]::WaitAll($tasks) } catch { }
+        }
+        $online = @(foreach ($p in $pending) {
+                $ok = $false
+                if ($p.Task -and $p.Task.IsCompleted -and -not $p.Task.IsFaulted) {
+                    try { $ok = ($p.Task.Result.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) } catch { }
+                }
+                if ($ok) { $p.Name }
+                $p.Ping.Dispose()
+            })
+        [pscustomobject]@{ Online = $online; Offline = @($Names | Where-Object { $online -notcontains $_ }) }
+    } -ArgumentList $ComputerName, $TimeoutMs
 }
 
 # Start-BlockApply - в фоне запускает $script:ApplyBlockScript (завершение процессов, уведомление и, по
@@ -1348,7 +1404,11 @@ function Invoke-AccountLockFollowUp {
 #   учётки); $label - текст для журнала; $job - фоновое задание закрытия; $result - его итог (только в
 #   headless-режиме, см. Receive-JobResults).
 function Invoke-BlockSweep {
-    param([Parameter(Mandatory)][object[]]$Rows)
+    # [AllowEmptyCollection()] - без неё Mandatory-параметр массива в PowerShell отказывается привязать
+    # ПУСТОЙ массив (бросает ошибку ещё до первой строки тела функции) - а пустой $Rows - совершенно
+    # нормальный случай (сканирование прошло успешно, но ни один опрошенный компьютер не вернул ни одной
+    # строки), который и обрабатывается следующей строкой.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
     if ($Rows.Count -eq 0) { return }
     $blocks = @((Get-BlockTable).Rows | Where-Object { [int]$_.Active -eq 1 })
     if ($blocks.Count -eq 0) { return }
@@ -1832,9 +1892,11 @@ function Import-AdComputers {
 # Сбор процессов
 # ---------------------------------------------------------------------------
 
-# Start-Scan - обработчик "Собрать процессы": берёт отмеченные компьютеры, запускает сбор в фоне и
-#   регистрирует наблюдение за ним. Локальные: $names - имена отмеченных компьютеров; $p - прогресс
-#   (Done/Total) внутри блока OnProgress; $job - задание.
+# Start-Scan - обработчик "Собрать процессы": берёт отмеченные компьютеры и запускает ПРОВЕРКУ ДОСТУПНОСТИ
+#   (пинг) в фоновом задании (Start-PingCheck) - не напрямую сбор, см. её комментарий про зависание окна на
+#   DNS. Сам сбор (Invoke-Command -AsJob) запускается дальше, из Complete-PingCheck, когда список
+#   ответивших компьютеров уже известен. Локальные: $names - имена отмеченных компьютеров; $pingJob - заданиe
+#   проверки доступности.
 function Start-Scan {
     $names = @($script:CompList.CheckedItems | ForEach-Object { $_.Text })
     if ($names.Count -eq 0) {
@@ -1845,9 +1907,33 @@ function Start-Scan {
     $script:Progress.Maximum = $names.Count
     $script:Progress.Value = 0
     Write-Log "Старт сбора: компьютеров $($names.Count)"
-    Set-Status "Опрос компьютеров: 0 из $($names.Count)"
+    Set-Status "Проверка доступности компьютеров (ping)..."
     try {
-        $script:ScanJob = Start-Collection -ComputerName $names
+        $pingJob = Start-PingCheck -ComputerName $names
+    }
+    catch {
+        Set-ScanBusy $false
+        Write-Log "Не удалось запустить проверку доступности: $($_.Exception.Message)"
+        Show-Message -Text $_.Exception.Message -Icon Error
+        return
+    }
+    Register-UiJob -Job $pingJob -OnDone { param($job) Complete-PingCheck -Job $job -ComputerName $names }.GetNewClosure()
+}
+
+# Complete-PingCheck - вызывается по завершении фонового пинга (Start-PingCheck): теперь, когда известно, кто
+#   онлайн, запускает настоящий сбор (Start-RemoteCollection - Invoke-Command -AsJob) и ставит ЕГО на
+#   наблюдение таймером, как раньше делал Start-Scan сразу после Start-Collection. -Job завершённое задание
+#   пинга; -ComputerName весь исходный список (для RequestedCount/Offline). Локальные: $pingResult -
+#   { Online, Offline } (результат Start-PingCheck); $p - прогресс (Done/Total) внутри блока OnProgress.
+function Complete-PingCheck {
+    param($Job, [string[]]$ComputerName)
+    $pingResult = Receive-Job -Job $Job -ErrorAction SilentlyContinue
+    Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
+    $online = @($pingResult.Online)
+    $offline = @($pingResult.Offline)
+
+    try {
+        $script:ScanJob = Start-RemoteCollection -ComputerName $ComputerName -Online $online -Offline $offline
     }
     catch {
         Set-ScanBusy $false
@@ -1855,6 +1941,7 @@ function Start-Scan {
         Show-Message -Text $_.Exception.Message -Icon Error
         return
     }
+    Set-Status "Опрос компьютеров: 0 из $($ComputerName.Count)"
     Register-UiJob -Job $script:ScanJob -OnProgress {
         param($job)
         $p = Get-JobProgress -Job $job
