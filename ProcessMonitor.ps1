@@ -938,17 +938,80 @@ function Get-RemoteSessionOption {
     New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 900000 -NoMachineProfile
 }
 
-# Start-Collection - запускает сбор процессов сразу на нескольких компьютерах в фоне (Invoke-Command -AsJob).
-#   -ComputerName  имена компьютеров; -ThrottleLimit  сколько компьютеров опрашивать одновременно (32).
-#   Возвращает родительское задание: по одному дочернему заданию на каждый компьютер.
+# Get-OnlineComputers - проверяет пингом (ICMP), какие из перечисленных компьютеров сейчас включены и отвечают
+#   по сети, и возвращает только их. Делается ПАРАЛЛЕЛЬНО для всех сразу через System.Net.NetworkInformation.Ping
+#   (SendPingAsync) с коротким таймаутом - иначе проверка десятков компьютеров, часть из которых выключена,
+#   последовательным Test-Connection сама по себе заняла бы минуты; так же быстро, независимо от их количества,
+#   отсеиваются и выключенные машины, которым иначе пришлось бы ждать 20-секундного таймаута открытия
+#   WinRM-сессии (см. Get-RemoteSessionOption) на каждую. -ComputerName список имён; -TimeoutMs таймаут ОДНОГО
+#   пинга в миллисекундах (1000 по умолчанию - этого достаточно в пределах локальной сети/домена).
+#   Возвращает только имена ответивших компьютеров, в точности как они были переданы (не меняет регистр/имя).
+#   Если отправить пинг не удалось вообще (например, имя не резолвится в DNS) - компьютер просто считается
+#   недоступным, без ошибки: вызывающему коду не нужно знать разницу между "выключен" и "не резолвится".
+#   Локальные: $pending - по одному элементу { Name, Ping, Task } на каждый компьютер; $tasks - только реально
+#   отправленные задачи ping (для WaitAll); $p - текущий элемент при разборе результатов; $ok - ответил ли он.
+function Get-OnlineComputers {
+    param([Parameter(Mandatory)][string[]]$ComputerName, [int]$TimeoutMs = 1000)
+    $pending = foreach ($name in $ComputerName) {
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $task = $null
+        try { $task = $ping.SendPingAsync($name, $TimeoutMs) } catch { }
+        [pscustomobject]@{ Name = $name; Ping = $ping; Task = $task }
+    }
+    $tasks = @($pending | Where-Object { $_.Task } | ForEach-Object { $_.Task })
+    if ($tasks.Count -gt 0) {
+        # Сбой/таймаут отдельных задач превращает WaitAll в исключение (AggregateException), но не мешает
+        # результатам ОСТАЛЬНЫХ, уже завершившихся задач - поэтому ошибка просто игнорируется, а не прерывает проверку.
+        try { [System.Threading.Tasks.Task]::WaitAll($tasks) } catch { }
+    }
+    $online = foreach ($p in $pending) {
+        $ok = $false
+        if ($p.Task -and $p.Task.IsCompleted -and -not $p.Task.IsFaulted) {
+            try { $ok = ($p.Task.Result.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) } catch { }
+        }
+        if ($ok) { $p.Name }
+        $p.Ping.Dispose()
+    }
+    , @($online)
+}
+
+# Start-Collection - запускает сбор процессов сразу на нескольких компьютерах в фоне (Invoke-Command -AsJob),
+#   предварительно отсеяв пингом (Get-OnlineComputers) те, что сейчас выключены или недоступны по сети - на них
+#   WinRM вообще не пробуется, они сразу попадают в итоговые Failures с понятной причиной (через Receive-JobResults).
+#   -ComputerName  имена компьютеров (весь запрошенный список, включая потенциально выключенные);
+#   -ThrottleLimit  сколько компьютеров опрашивать одновременно (32).
+#   Возвращает родительское задание: по одному дочернему заданию на каждый ВКЛЮЧЁННЫЙ компьютер (у остальных
+#   дочерних заданий не будет - вместо этого у возвращённого задания есть дополнительные свойства
+#   RequestedCount (весь исходный список, для подсчёта "компьютеров X из Y" на стороне вызывающего кода) и
+#   OfflineFailures (отсеянные пингом, в формате { Computer, Message }, как Failures у Receive-JobResults) -
+#   Receive-JobResults сама подмешивает их в общий список Failures, вызывающему коду ничего отдельно делать не нужно.
+#   Если пингом не ответил вообще ни один компьютер - настоящее задание всё равно создаётся (Start-Job с пустым
+#   телом), чтобы остальной конвейер (Register-UiJob, Get-JobProgress, Receive-JobResults), рассчитанный на
+#   настоящий объект задания, продолжал работать без особого случая "задания нет".
+#   Локальные: $online/$offline - включённые/выключенные по результату пинга; $offlineFailures - вторые в
+#   формате Failures; $job - создаваемое задание.
 function Start-Collection {
     param(
         [Parameter(Mandatory)][string[]]$ComputerName,
         [int]$ThrottleLimit = 32
     )
-    Invoke-Command -ComputerName $ComputerName -ScriptBlock $script:CollectScript `
-        -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
-        -AsJob -JobName 'ProcMon-Collect'
+    $online = @(Get-OnlineComputers -ComputerName $ComputerName)
+    $offline = @($ComputerName | Where-Object { $online -notcontains $_ })
+    $offlineFailures = @($offline | ForEach-Object {
+            [pscustomobject]@{ Computer = $_; Message = 'не отвечает на ping (выключен или недоступен по сети)' }
+        })
+
+    if ($online.Count -gt 0) {
+        $job = Invoke-Command -ComputerName $online -ScriptBlock $script:CollectScript `
+            -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
+            -AsJob -JobName 'ProcMon-Collect'
+    }
+    else {
+        $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
+    }
+    Add-Member -InputObject $job -MemberType NoteProperty -Name RequestedCount -Value $ComputerName.Count -Force
+    Add-Member -InputObject $job -MemberType NoteProperty -Name OfflineFailures -Value $offlineFailures -Force
+    return $job
 }
 
 # Start-BlockApply - в фоне запускает $script:ApplyBlockScript (обновление политик, завершение процессов,
@@ -1011,25 +1074,36 @@ function Start-SrpEventCheck {
         -SessionOption (Get-RemoteSessionOption) -ThrottleLimit 32 -AsJob -JobName 'ProcMon-Events'
 }
 
-# Get-JobProgress - прогресс фонового задания: сколько компьютеров уже завершили работу.
-#   Возвращает { Done = завершено, Total = всего }. $children - дочерние задания, $done - число завершённых.
+# Get-JobProgress - прогресс фонового задания: сколько компьютеров уже завершили работу. Компьютеры, отсеянные
+#   пингом в Start-Collection (свойство OfflineFailures у $Job, если оно есть - см. там же), сразу считаются
+#   завершёнными и входят и в Done, и в Total - ждать их уже не нужно, результат по ним известен сразу.
+#   Возвращает { Done = завершено, Total = всего }. $children - дочерние задания; $offlineCount - сколько
+#   отсеяно пингом; $done - число завершённых (включая отсеянные).
 function Get-JobProgress {
     param([Parameter(Mandatory)]$Job)
     $children = @($Job.ChildJobs)
-    $done = @($children | Where-Object { $_.State -notin 'Running', 'NotStarted' }).Count
-    [pscustomobject]@{ Done = $done; Total = $children.Count }
+    $offlineCount = 0
+    if ($Job.PSObject.Properties['OfflineFailures']) { $offlineCount = @($Job.OfflineFailures).Count }
+    $done = @($children | Where-Object { $_.State -notin 'Running', 'NotStarted' }).Count + $offlineCount
+    [pscustomobject]@{ Done = $done; Total = $children.Count + $offlineCount }
 }
 
-# Receive-JobResults - забирает итог фонового задания и удаляет задание.
+# Receive-JobResults - забирает итог фонового задания и удаляет задание. Компьютеры, отсеянные пингом в
+#   Start-Collection (свойство OfflineFailures у $Job, если оно есть), попадают в Failures так же, как обычный
+#   сбой WinRM - вызывающему коду не нужно знать, что часть сбоев определилась ещё до старта задания.
 #   Возвращает { Data = все полученные объекты, Failures = компьютеры, не давшие данных, с причиной
 #   (Computer, Message), Succeeded = сколько компьютеров ответило }.
-#   Локальные: $data - собранные данные; $failures - список сбоев; $succeeded - счётчик успешных;
-#   $child - задание одного компьютера; $items - его данные; $reason / $message - причина сбоя.
+#   Локальные: $data - собранные данные; $failures - список сбоев (начинается с OfflineFailures, если есть);
+#   $succeeded - счётчик успешных; $child - задание одного компьютера; $items - его данные;
+#   $reason / $message - причина сбоя.
 function Receive-JobResults {
     param([Parameter(Mandatory)]$Job)
 
     $data = New-Object System.Collections.ArrayList
     $failures = New-Object System.Collections.ArrayList
+    if ($Job.PSObject.Properties['OfflineFailures']) {
+        foreach ($f in @($Job.OfflineFailures)) { [void]$failures.Add($f) }
+    }
     $succeeded = 0
     foreach ($child in $Job.ChildJobs) {
         if ($child.State -eq 'Completed') {
@@ -2174,11 +2248,13 @@ function Start-Scan {
 
 # Complete-Scan - вызывается, когда сбор завершён: показывает ошибки в журнале, сохраняет данные в хранилище
 #   как новое сканирование и открывает его на вкладке "Процессы".
-#   -Job завершённое задание. Локальные: $requested - сколько компьютеров опрашивали; $result - итог
-#   (см. Receive-JobResults); $f - сбой одного компьютера; $scan - созданное сканирование (Id, Date).
+#   -Job завершённое задание. Локальные: $requested - сколько компьютеров опрашивали (весь исходный список,
+#   включая отсеянные пингом в Start-Collection - RequestedCount, если есть; иначе, для совместимости,
+#   как раньше - число дочерних заданий); $result - итог (см. Receive-JobResults); $f - сбой одного компьютера;
+#   $scan - созданное сканирование (Id, Date).
 function Complete-Scan {
     param($Job)
-    $requested = @($Job.ChildJobs).Count
+    $requested = if ($Job.PSObject.Properties['RequestedCount']) { [int]$Job.RequestedCount } else { @($Job.ChildJobs).Count }
     $result = Receive-JobResults -Job $Job
     $script:ScanJob = $null
     Set-ScanBusy $false
