@@ -189,16 +189,21 @@ function Initialize-Database {
     $script:StoreDir = $Path
     $script:Scans = New-Object System.Collections.ArrayList
     $script:Blocks = New-Object System.Collections.ArrayList
+    $script:BlockHits = New-Object System.Collections.ArrayList
 
     $scansFile = Join-Path $Path 'scans.json'
     $blocksFile = Join-Path $Path 'blocks.json'
+    $hitsFile = Join-Path $Path 'block-hits.json'
     $scansDoc = Read-JsonFile -Path $scansFile
     $blocksDoc = Read-JsonFile -Path $blocksFile
+    $hitsDoc = Read-JsonFile -Path $hitsFile
     foreach ($item in (Get-JsonList -Document $scansDoc -Key 'Scans')) { [void]$script:Scans.Add($item) }
     foreach ($item in (Get-JsonList -Document $blocksDoc -Key 'Blocks')) { [void]$script:Blocks.Add($item) }
+    foreach ($item in (Get-JsonList -Document $hitsDoc -Key 'Hits')) { [void]$script:BlockHits.Add($item) }
 
     if (-not $scansDoc) { Save-ScanIndex }
     if (-not $blocksDoc) { Save-BlockLog }
+    if (-not $hitsDoc) { Save-BlockHits }
 }
 
 # Save-ScanIndex - записывает список сканирований из памяти в scans.json.
@@ -209,6 +214,12 @@ function Save-ScanIndex {
 # Save-BlockLog - записывает журнал блокировок из памяти в blocks.json.
 function Save-BlockLog {
     Write-JsonFile -Path (Join-Path $script:StoreDir 'blocks.json') -Data ([ordered]@{ Version = 1; Blocks = $script:Blocks })
+}
+
+# Save-BlockHits - записывает подробный журнал обнаружений (каждый отдельный случай, когда заблокированный
+#   файл застали запущенным - время/компьютер/пользователь/путь) из памяти в block-hits.json.
+function Save-BlockHits {
+    Write-JsonFile -Path (Join-Path $script:StoreDir 'block-hits.json') -Data ([ordered]@{ Version = 1; Hits = $script:BlockHits })
 }
 
 # Get-ScanFilePath - путь к файлу с процессами сканирования: <данные>\scans\scan-000001.json. -Id номер сканирования.
@@ -357,9 +368,10 @@ function Get-ProcessTable {
     return , $table
 }
 
-# Get-HashLocations - где найден хэш: компьютеры и пути по ПОСЛЕДНЕМУ сканированию каждого компьютера.
-#   Нужна, чтобы показать "найден на N компьютерах" и чтобы знать, где завершать процессы.
-#   -Algorithm, -Hash  алгоритм и значение хэша. Возвращает таблицу: Computer, Path.
+# Get-HashLocations - где найден хэш: компьютеры, пути и пользователи по ПОСЛЕДНЕМУ сканированию каждого компьютера.
+#   Нужна, чтобы показать "найден на N компьютерах", знать, где завершать процессы, и кто их запустил (для
+#   подробного журнала обнаружений, Add-BlockHit).
+#   -Algorithm, -Hash  алгоритм и значение хэша. Возвращает таблицу: Computer, Path, User.
 #   Идём по сканированиям от новых к старым; $resolved - компьютеры, для которых последнее сканирование уже
 #   найдено; $fresh - компьютеры, для которых текущее сканирование - последнее; $seen - защита от повторов.
 function Get-HashLocations {
@@ -370,6 +382,7 @@ function Get-HashLocations {
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('Computer', [string])
     [void]$table.Columns.Add('Path', [string])
+    [void]$table.Columns.Add('User', [string])
 
     $wanted = $Hash.ToUpper()
     $resolved = @{}
@@ -387,7 +400,9 @@ function Get-HashLocations {
             $key = '{0}|{1}' -f $p['Computer'], $p['Path']
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
-            [void]$table.Rows.Add([string]$p['Computer'], [string]$p['Path'])
+            $user = ''
+            if ($p.ContainsKey('User')) { $user = [string]$p['User'] }        # старые сканирования без этого поля
+            [void]$table.Rows.Add([string]$p['Computer'], [string]$p['Path'], $user)
         }
     }
     return , $table
@@ -433,12 +448,14 @@ function Add-BlockRecord {
 }
 
 # Get-BlockTable - все блокировки (новые сверху) для вкладки "Блокировки".
-#   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime - сколько раз и когда в последний
-#   раз сканирование заставало этот файл запущенным уже ПОСЛЕ блокировки (см. Register-BlockHit - считает сама
-#   проверка после сканирования, журнал событий Windows не используется). LockAccount - заблокирована ли
-#   ПОЛНОСТЬЮ учётная запись того, кого поймают с этим файлом (см. Add-BlockRecord); у записей, сделанных до
-#   появления этой возможности, поля LockAccount/EventCount нет в файле на диске, поэтому читаются с запасным
-#   значением (0) - для них галочки на вкладке "Блокировки" просто окажутся пустыми/нулевыми.
+#   Поле Status: "Активна" (Active=1) или "Снята". EventCount/LastEventTime/LastComputer/LastUser - сколько раз,
+#   когда, на каком компьютере и под каким пользователем в последний раз сканирование заставало этот файл
+#   запущенным уже ПОСЛЕ блокировки (см. Add-BlockHit - считает сама проверка после сканирования, журнал событий
+#   Windows не используется; подробный журнал каждого отдельного случая - Get-BlockHitsTable/block-hits.json).
+#   LockAccount - заблокирована ли ПОЛНОСТЬЮ учётная запись того, кого поймают с этим файлом (см. Add-BlockRecord);
+#   у записей, сделанных до появления этой возможности, поля LockAccount/EventCount/LastComputer/LastUser нет в
+#   файле на диске, поэтому читаются с запасным значением (0/пусто) - для них эти колонки просто окажутся
+#   пустыми/нулевыми.
 function Get-BlockTable {
     $table = New-Object System.Data.DataTable
     [void]$table.Columns.Add('Id', [int])
@@ -451,6 +468,8 @@ function Get-BlockTable {
     [void]$table.Columns.Add('LockAccount', [string])
     [void]$table.Columns.Add('EventCount', [int])
     [void]$table.Columns.Add('LastEventTime', [string])
+    [void]$table.Columns.Add('LastComputer', [string])
+    [void]$table.Columns.Add('LastUser', [string])
     for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
         $b = $script:Blocks[$i]
         $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
@@ -461,10 +480,33 @@ function Get-BlockTable {
         if ($b.Contains('EventCount')) { $eventCount = [int]$b['EventCount'] }
         $lastEventTime = ''
         if ($b.Contains('LastEventTime')) { $lastEventTime = [string]$b['LastEventTime'] }
+        $lastComputer = ''
+        if ($b.Contains('LastComputer')) { $lastComputer = [string]$b['LastComputer'] }
+        $lastUser = ''
+        if ($b.Contains('LastUser')) { $lastUser = [string]$b['LastUser'] }
         $lockAccount = 'Нет'
         if ($b.Contains('LockAccount') -and [int]$b['LockAccount'] -eq 1) { $lockAccount = 'Да' }
         [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
-            [string]$b['Hash'], [int]$b['Active'], $status, $lockAccount, $eventCount, $lastEventTime)
+            [string]$b['Hash'], [int]$b['Active'], $status, $lockAccount, $eventCount, $lastEventTime,
+            $lastComputer, $lastUser)
+    }
+    return , $table
+}
+
+# Get-BlockHitsTable - подробный журнал обнаружений ОДНОЙ блокировки (для окна "История обнаружений"): каждая
+#   строка - отдельный случай, когда сканирование застало файл запущенным. -BlockId номер блокировки.
+#   Возвращает таблицу Time/Computer/User/Path, новые сверху.
+function Get-BlockHitsTable {
+    param([Parameter(Mandatory)][int]$BlockId)
+    $table = New-Object System.Data.DataTable
+    [void]$table.Columns.Add('Time', [string])
+    [void]$table.Columns.Add('Computer', [string])
+    [void]$table.Columns.Add('User', [string])
+    [void]$table.Columns.Add('Path', [string])
+    for ($i = $script:BlockHits.Count - 1; $i -ge 0; $i--) {
+        $h = $script:BlockHits[$i]
+        if ([int]$h['BlockId'] -ne $BlockId) { continue }
+        [void]$table.Rows.Add([string]$h['Time'], [string]$h['Computer'], [string]$h['User'], [string]$h['Path'])
     }
     return , $table
 }
@@ -490,23 +532,48 @@ function Disable-BlockRecord {
     Save-BlockLog
 }
 
-# Register-BlockHit - отмечает, что сканирование (ручное или плановое) застало заблокированный файл запущенным
-#   УЖЕ ПОСЛЕ блокировки - вызывается из Invoke-BlockSweep при каждом совпадении, а не по запросу администратора
-#   (в отличие от прежней кнопки "Проверить срабатывания", которая опиралась на журнал событий Windows - теперь
-#   этого источника нет, но он и не нужен: сама проверка после сканирования и есть факт обнаружения).
-#   -Id номер записи; -Count на скольких компьютерах нашли за этот один проход (прибавляется к счётчику, а не
-#   заменяет его - EventCount копит сумму за всё время). Обновляет и EventCount, и LastEventTime (текущее время).
-function Register-BlockHit {
-    param([Parameter(Mandatory)][int]$Id, [Parameter(Mandatory)][int]$Count)
+# Add-BlockHit - отмечает ОДИН конкретный случай, когда сканирование (ручное или плановое) застало заблокированный
+#   файл запущенным УЖЕ ПОСЛЕ блокировки - вызывается из Invoke-BlockSweep/Invoke-BlockSelected(Batch) по разу на
+#   каждое отдельное сочетание компьютер+пользователь+путь, а не по запросу администратора (в отличие от прежней
+#   кнопки "Проверить срабатывания", которая опиралась на журнал событий Windows - теперь этого источника нет, но
+#   он и не нужен: сама проверка после сканирования и есть факт обнаружения).
+#   -BlockId номер блокировки; -Computer компьютер; -User пользователь (если известен); -Path путь к файлу.
+#   Делает две вещи: 1) обновляет сводные поля самой блокировки в blocks.json - EventCount (копится за всё время),
+#   LastEventTime/LastComputer/LastUser (последний случай, для быстрого взгляда на вкладке "Блокировки");
+#   2) добавляет подробную запись в журнал обнаружений block-hits.json (время/компьютер/пользователь/путь
+#   каждого случая отдельно - для окна "История обнаружений", Get-BlockHitsTable).
+function Add-BlockHit {
+    param(
+        [Parameter(Mandatory)][int]$BlockId,
+        [Parameter(Mandatory)][string]$Computer,
+        [string]$User = '',
+        [string]$Path = ''
+    )
+    $time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     foreach ($b in $script:Blocks) {
-        if ([int]$b['Id'] -eq $Id) {
+        if ([int]$b['Id'] -eq $BlockId) {
             $current = 0
             if ($b.Contains('EventCount')) { $current = [int]$b['EventCount'] }
-            $b['EventCount'] = $current + $Count
-            $b['LastEventTime'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            $b['EventCount'] = $current + 1
+            $b['LastEventTime'] = $time
+            $b['LastComputer'] = $Computer
+            $b['LastUser'] = $User
         }
     }
+    $id = 1
+    foreach ($h in $script:BlockHits) {
+        if ([int]$h['Id'] -ge $id) { $id = [int]$h['Id'] + 1 }
+    }
+    [void]$script:BlockHits.Add([ordered]@{
+            Id       = $id
+            BlockId  = $BlockId
+            Time     = $time
+            Computer = $Computer
+            User     = $User
+            Path     = $Path
+        })
     Save-BlockLog
+    Save-BlockHits
 }
 
 # ===========================================================================
@@ -1126,6 +1193,14 @@ function Invoke-SelfTest {
             Assert-True (@($table.Rows | Where-Object { $_.Name -eq 'b.exe' })[0].User -eq '') 'пустой пользователь должен читаться как пустая строка'
             Assert-True ((Get-HashLocations -Algorithm MD5 -Hash 'aa').Rows.Count -eq 2) 'Get-HashLocations: ожидалось 2 места'
             Assert-True (Get-ActiveBlock -Algorithm MD5 -Hash 'AA') 'активная блокировка не найдена после перезагрузки'
+            Add-BlockHit -BlockId 1 -Computer 'PC1' -User 'DOM\иванов' -Path 'C:\тест.exe'
+            Add-BlockHit -BlockId 1 -Computer 'PC3' -User 'DOM\petrov' -Path 'C:\тест.exe'
+            $blockRow = (Get-BlockTable).Rows | Where-Object { [int]$_.Id -eq 1 }
+            Assert-True ($blockRow.EventCount -eq 2) "EventCount: ожидалось 2, получено $($blockRow.EventCount)"
+            Assert-True ($blockRow.LastComputer -eq 'PC3' -and $blockRow.LastUser -eq 'DOM\petrov') 'LastComputer/LastUser не обновились последним случаем'
+            $hits = Get-BlockHitsTable -BlockId 1
+            Assert-True ($hits.Rows.Count -eq 2) "журнал обнаружений: ожидалось 2 записи, получено $($hits.Rows.Count)"
+            Assert-True ($hits.Rows[0].Computer -eq 'PC3') 'журнал обнаружений должен быть новыми сверху'
             Disable-BlockRecord -Id 1
             Assert-True (-not (Get-ActiveBlock -Algorithm MD5 -Hash 'AA')) 'блокировка не снялась'
             Assert-True ((Get-BlockTable).Rows[0].Status -eq 'Снята') 'статус блокировки неверный'
@@ -1285,17 +1360,24 @@ function Invoke-BlockSweep {
         if ($matches.Count -eq 0) { continue }
 
         $map = @{}
+        $hitEvents = New-Object System.Collections.ArrayList
+        $seenHit = @{}
         foreach ($m in $matches) {
             $key = ([string]$m.Computer).ToUpper()
             $path = [string]$m.Path
             if (-not $map.ContainsKey($key)) { $map[$key] = @() }
             if ($map[$key] -notcontains $path) { $map[$key] += $path }
+            $hitKey = '{0}|{1}|{2}' -f $key, [string]$m.User, $path
+            if (-not $seenHit.ContainsKey($hitKey)) {
+                $seenHit[$hitKey] = $true
+                [void]$hitEvents.Add(@{ Computer = $key; User = [string]$m.User; Path = $path })
+            }
         }
         $lockAccount = [string]$b.LockAccount -eq 'Да'
         $notifyText = if ($lockAccount) { $script:LockNotifyTemplate -f ([string]$b.Name) } else { $script:NotifyTemplate -f ([string]$b.Name) }
         $label = "'{0}' ({1} {2})" -f $b.Name, $algo, $hash
 
-        Register-BlockHit -Id ([int]$b.Id) -Count $matches.Count
+        foreach ($h in $hitEvents) { Add-BlockHit -BlockId ([int]$b.Id) -Computer $h.Computer -User $h.User -Path $h.Path }
 
         try {
             $job = Start-BlockApply -Map $map -NotifyText $notifyText -LogoffSessions $lockAccount -LockAccount $lockAccount
@@ -1614,16 +1696,19 @@ $tabProcesses.Controls.Add($procBar)
 #   следующем сканировании, см. Invoke-BlockSweep) - закрытие файла, уведомление, ПРИНУДИТЕЛЬНОЕ завершение
 #   сеанса и ПОЛНОЕ отключение учётной записи пользователя в AD (см. README.md); если выключено - как раньше,
 #   только закрытие и уведомление, а завершение сеанса администратор решает каждый раз отдельным вопросом.
-#   $btnUnblock - "Снять блокировку"; $script:BlockGrid - таблица всех блокировок (Срабатываний/Последнее
-#   обнаружение - теперь считает сама проверка после сканирования, Invoke-BlockSweep, а не журнал событий
-#   Windows, как раньше у "Проверить срабатывания" - эта кнопка убрана за ненадобностью).
+#   $btnUnblock - "Снять блокировку"; $btnHitHistory - "История обнаружений" (подробный журнал по выбранной
+#   блокировке - время/компьютер/пользователь каждого случая, см. Get-BlockHitsTable); $script:BlockGrid -
+#   таблица всех блокировок (Срабатываний/Последнее обнаружение/компьютер/пользователь - теперь считает сама
+#   проверка после сканирования, Invoke-BlockSweep, а не журнал событий Windows, как раньше у "Проверить
+#   срабатывания" - эта кнопка убрана за ненадобностью).
 $blockBar = New-Toolbar
 $script:LockAccountCheck = New-Object System.Windows.Forms.CheckBox -Property @{
     Text = 'Также блокировать учётную запись пользователя при обнаружении'; AutoSize = $true
     Margin = (New-Object System.Windows.Forms.Padding(8, 10, 2, 0))
 }
 $btnUnblock = New-Button 'Снять блокировку' 140
-$blockBar.Controls.AddRange(@($script:LockAccountCheck, $btnUnblock))
+$btnHitHistory = New-Button 'История обнаружений' 170
+$blockBar.Controls.AddRange(@($script:LockAccountCheck, $btnUnblock, $btnHitHistory))
 
 $script:BlockGrid = New-Grid
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
@@ -1633,6 +1718,8 @@ Add-GridColumn $script:BlockGrid 'Хэш' 'Hash' 330 -Mono
 Add-GridColumn $script:BlockGrid 'Блокировка учётной записи' 'LockAccount' 160
 Add-GridColumn $script:BlockGrid 'Срабатываний' 'EventCount' 100
 Add-GridColumn $script:BlockGrid 'Последнее обнаружение' 'LastEventTime' 150
+Add-GridColumn $script:BlockGrid 'Последний компьютер' 'LastComputer' 130
+Add-GridColumn $script:BlockGrid 'Последний пользователь' 'LastUser' 150
 Add-GridColumn $script:BlockGrid 'Статус' 'Status' 100 -Fill
 
 $tabBlocks.Controls.Add($script:BlockGrid)
@@ -2001,7 +2088,9 @@ function Invoke-BlockSelected {
             $map[$key] += [string]$loc.Path
         }
         $blockId = [int](Get-ActiveBlock -Algorithm $algorithm -Hash $hash)['Id']
-        Register-BlockHit -Id $blockId -Count $map.Count
+        foreach ($loc in $locations.Rows) {
+            Add-BlockHit -BlockId $blockId -Computer ([string]$loc.Computer).ToUpper() -User ([string]$loc.User) -Path ([string]$loc.Path)
+        }
         $action = 'завершение процессов + уведомление'
         if ($logoffSessions) { $action += ' + завершение сеанса' }
         if ($lockAccount) { $action += ' + блокировка учётной записи' }
@@ -2154,7 +2243,9 @@ function Invoke-BlockSelectedBatch {
             $notifyText = if ($lockAccount) { $script:LockNotifyTemplate -f $item.Name } else { $script:NotifyTemplate -f $item.Name }
             $label = "'$($item.Name)' ($algorithm $($item.Hash))"
             $blockId = [int](Get-ActiveBlock -Algorithm $algorithm -Hash $item.Hash)['Id']
-            Register-BlockHit -Id $blockId -Count $map.Count
+            foreach ($loc in $locations.Rows) {
+                Add-BlockHit -BlockId $blockId -Computer ([string]$loc.Computer).ToUpper() -User ([string]$loc.User) -Path ([string]$loc.Path)
+            }
             try {
                 $job = Start-BlockApply -Map $map -NotifyText $notifyText -LogoffSessions $logoffSessions -LockAccount $lockAccount
                 Register-UiJob -Job $job -OnDone { param($j) Complete-BlockApply -Job $j -LockAccount $lockAccount -BlockLabel $label }.GetNewClosure()
@@ -2197,6 +2288,35 @@ function Invoke-UnblockSelected {
         Write-Log "Ошибка снятия блокировки: $($_.Exception.Message)"
         Show-Message -Text "Не удалось снять блокировку:`n$($_.Exception.Message)" -Icon Error
     }
+}
+
+# Invoke-ShowHitHistory - обработчик "История обнаружений": отдельное окно со всеми отдельными случаями
+#   обнаружения выбранной блокировки запущенной (время/компьютер/пользователь/путь), а не только сводкой
+#   (Срабатываний/Последнее обнаружение) с основной таблицы - см. Get-BlockHitsTable.
+#   Локальные: $row - выбранная блокировка; $win - окно; $grid - таблица обнаружений.
+function Invoke-ShowHitHistory {
+    if (-not $script:BlockGrid.CurrentRow -or -not $script:BlockGrid.CurrentRow.DataBoundItem) {
+        Show-Message -Text 'Выберите блокировку в таблице.' -Icon Warning
+        return
+    }
+    $row = $script:BlockGrid.CurrentRow.DataBoundItem.Row
+    $blockId = [int]$row['Id']
+
+    $win = New-Object System.Windows.Forms.Form
+    $win.Text = "История обнаружений - '$($row['Name'])' ($($row['Algorithm']) $($row['Hash']))"
+    $win.Width = 820
+    $win.Height = 480
+    $win.StartPosition = 'CenterParent'
+
+    $grid = New-Grid
+    Add-GridColumn $grid 'Время' 'Time' 150
+    Add-GridColumn $grid 'Компьютер' 'Computer' 130
+    Add-GridColumn $grid 'Пользователь' 'User' 170
+    Add-GridColumn $grid 'Путь' 'Path' 300 -Fill
+    $grid.DataSource = (Get-BlockHitsTable -BlockId $blockId).DefaultView
+    $win.Controls.Add($grid)
+
+    [void]$win.ShowDialog($script:Form)
 }
 
 # ---------------------------------------------------------------------------
@@ -2270,6 +2390,7 @@ $btnBlock.Add_Click({
         else { Invoke-BlockSelected }
     })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
+$btnHitHistory.Add_Click({ Invoke-ShowHitHistory })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
         else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
