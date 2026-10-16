@@ -689,8 +689,11 @@ function Get-AdUsersWithOuStatus {
 #   вызывающий код должен в этом случае залогировать неудачу, а не считать её исключением.
 #   Локальные: $root/$domainDn - корень домена; $searcher - объект поиска; $result - найденная запись;
 #   $user - сам объект пользователя (для записи); $uac - текущее значение userAccountControl.
-function Disable-AdAccount {
-    param([Parameter(Mandatory)][string]$Sam)
+# Set-AdAccountDisabledFlag - общая часть Disable-AdAccount/Enable-AdAccount: находит пользователя по
+#   sAMAccountName и выставляет/снимает бит ACCOUNTDISABLE (0x2) в userAccountControl.
+#   -Sam логин; -Disabled $true - отключить, $false - включить обратно. Возвращает $true/$false (успех).
+function Set-AdAccountDisabledFlag {
+    param([Parameter(Mandatory)][string]$Sam, [Parameter(Mandatory)][bool]$Disabled)
     $searcher = $null
     try {
         $root = [System.DirectoryServices.DirectoryEntry]'LDAP://RootDSE'
@@ -703,7 +706,8 @@ function Disable-AdAccount {
         if (-not $result) { return $false }
         $user = $result.GetDirectoryEntry()
         $uac = [int]$user.Properties['userAccountControl'][0]
-        $user.Properties['userAccountControl'].Value = $uac -bor 0x2
+        $newUac = if ($Disabled) { $uac -bor 0x2 } else { $uac -band (-bnot 0x2) }
+        $user.Properties['userAccountControl'].Value = $newUac
         $user.CommitChanges()
         return $true
     }
@@ -713,6 +717,19 @@ function Disable-AdAccount {
     finally {
         if ($searcher) { $searcher.Dispose() }
     }
+}
+
+function Disable-AdAccount {
+    param([Parameter(Mandatory)][string]$Sam)
+    Set-AdAccountDisabledFlag -Sam $Sam -Disabled $true
+}
+
+# Enable-AdAccount - снимает бит ACCOUNTDISABLE (включает учётную запись обратно) - используется из
+#   Invoke-RestoreSelectedUser (правый клик по пользователю на вкладке "Пользователи"), чтобы администратор
+#   мог вернуть доступ без переключения в ADUC/dsa.msc.
+function Enable-AdAccount {
+    param([Parameter(Mandatory)][string]$Sam)
+    Set-AdAccountDisabledFlag -Sam $Sam -Disabled $false
 }
 
 # $script:CollectScript - скрипт, который выполняется НА УДАЛЁННОМ компьютере (передаётся в Invoke-Command).
@@ -1850,17 +1867,40 @@ $tabBlocks.Controls.Add($blockBar)
 # учётная запись отключена (красным) или активна (зелёным); не связана напрямую с блокировками по хэшу - это
 # просто общий обзор состояния учётных записей в AD (в т. ч. удобно проверить результат блокировки учётной
 # записи, см. "Блокировка учётной записи" в README.md, без необходимости открывать ADUC).
-#   $usersBar - панель инструментов; $btnLoadUsers - "Загрузить из AD"; $script:UsersTree - само дерево.
+#   $usersBar - панель инструментов; $btnLoadUsers - "Загрузить из AD"; $script:UsersTree - само дерево
+#   (правый клик по пользователю - "Включить учётную запись обратно", см. $script:UsersContextMenu и
+#   Invoke-RestoreSelectedUser); $script:UserBlockLogBox - журнал блокировок учётных записей снизу (та же
+#   выписка, что и в файле data\logs\account-blocks.log - время, пользователь, компьютер, причина).
 $usersBar = New-Toolbar
 $btnLoadUsers = New-Button 'Загрузить из AD' 140
-$usersLegend = New-Label 'Красным - учётная запись отключена; зелёным - активна'
+$usersLegend = New-Label 'Красным - учётная запись отключена; зелёным - активна; правый клик по пользователю - включить обратно'
 $usersBar.Controls.AddRange(@($btnLoadUsers, $usersLegend))
 
 $script:UsersTree = New-Object System.Windows.Forms.TreeView
 $script:UsersTree.Dock = 'Fill'
 $script:UsersTree.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
+# Контекстное меню по правому клику - только для пользователя (узел OU не несёт Tag, см. Update-UsersTree,
+# поэтому для него пункт меню не показывается вовсе - Add_Opening ниже отменяет открытие меню).
+$script:UsersContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$script:RestoreUserMenuItem = New-Object System.Windows.Forms.ToolStripMenuItem('Включить учётную запись обратно')
+[void]$script:UsersContextMenu.Items.Add($script:RestoreUserMenuItem)
+$script:UsersTree.ContextMenuStrip = $script:UsersContextMenu
+
+$usersLogPanel = New-Object System.Windows.Forms.Panel -Property @{ Dock = 'Bottom'; Height = 160 }
+$usersLogLabel = New-Object System.Windows.Forms.Label -Property @{
+    Text = 'Журнал блокировок учётных записей:'; Dock = 'Top'; AutoSize = $false; Height = 20
+    Padding = (New-Object System.Windows.Forms.Padding(2, 4, 0, 0))
+}
+$script:UserBlockLogBox = New-Object System.Windows.Forms.TextBox -Property @{
+    Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'; Dock = 'Fill'
+    Font = (New-Object System.Drawing.Font('Consolas', 9)); BackColor = [System.Drawing.Color]::White
+}
+$usersLogPanel.Controls.Add($script:UserBlockLogBox)
+$usersLogPanel.Controls.Add($usersLogLabel)
+
 $tabUsers.Controls.Add($script:UsersTree)
+$tabUsers.Controls.Add($usersLogPanel)
 $tabUsers.Controls.Add($usersBar)
 
 $script:Form.Controls.Add($tabs)
@@ -2000,6 +2040,7 @@ function Update-UsersTree {
                 $parent = $ouNode.Nodes
             }
             $leaf = New-Object System.Windows.Forms.TreeNode("$($u.Name) ($($u.Sam))")
+            $leaf.Tag = $u.Sam     # отличает лист-пользователя от узла OU (у того Tag не задан) - см. контекстное меню
             if ($u.Disabled) {
                 $leaf.BackColor = [System.Drawing.Color]::FromArgb(255, 205, 205)
                 $disabledCount++
@@ -2020,6 +2061,59 @@ function Update-UsersTree {
     }
     finally {
         $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+    Update-AccountBlockLogView
+}
+
+# Update-AccountBlockLogView - показывает в нижней панели вкладки "Пользователи" последние записи файла
+#   data\logs\account-blocks.log (кто, когда, за каким компьютером и за какой файл был заблокирован/включён
+#   обратно) - та же выписка, что и на диске, просто без необходимости открывать файл в Блокноте. Вызывается
+#   из Update-UsersTree (при каждом обновлении дерева) и из Invoke-RestoreSelectedUser.
+#   -Last сколько последних строк показать. $lines - прочитанные строки.
+function Update-AccountBlockLogView {
+    param([int]$Last = 300)
+    if (-not $script:AccountBlockLogFile -or -not (Test-Path -LiteralPath $script:AccountBlockLogFile)) {
+        $script:UserBlockLogBox.Text = '(пока нет записей - ни одна учётная запись ещё не блокировалась)'
+        return
+    }
+    try {
+        $lines = @(Get-Content -LiteralPath $script:AccountBlockLogFile -Tail $Last -Encoding UTF8)
+        $script:UserBlockLogBox.Text = if ($lines.Count -gt 0) { $lines -join [Environment]::NewLine } else { '(пока нет записей)' }
+        $script:UserBlockLogBox.SelectionStart = $script:UserBlockLogBox.Text.Length
+        $script:UserBlockLogBox.ScrollToCaret()
+    }
+    catch {
+        $script:UserBlockLogBox.Text = "Не удалось прочитать журнал блокировок учётных записей: $($_.Exception.Message)"
+    }
+}
+
+# Invoke-RestoreSelectedUser - обработчик пункта контекстного меню "Включить учётную запись обратно"
+#   (правый клик по пользователю на вкладке "Пользователи"): после подтверждения снимает ACCOUNTDISABLE
+#   (Enable-AdAccount), пишет событие в тот же журнал блокировок учётных записей (чтобы включение обратно
+#   тоже было видно в аудите - кто, когда) и перестраивает дерево (сразу видно, что строка позеленела).
+#   Локальные: $node - выбранный узел дерева; $sam - логин (Tag узла); $label - подпись узла для диалогов.
+function Invoke-RestoreSelectedUser {
+    $node = $script:UsersTree.SelectedNode
+    if (-not $node -or -not $node.Tag) { return }
+    $sam = [string]$node.Tag
+    $label = $node.Text
+    if (-not (Confirm-Action -Title 'Включение учётной записи' -Text (
+                "Включить учётную запись «{0}» обратно?`n`nПользователь снова сможет входить в домен." -f $label))) { return }
+    try {
+        $ok = Enable-AdAccount -Sam $sam
+        if ($ok) {
+            Write-AccountBlockLog -Message ("Пользователь {0}: учётная запись включена обратно администратором приложения" -f $sam)
+            Write-Log "Учётная запись включена обратно: $sam"
+            Set-Status "Учётная запись включена обратно: $sam"
+            Update-UsersTree
+        }
+        else {
+            Show-Message -Icon Error -Text ("Не удалось включить учётную запись «{0}» обратно - проверьте права на изменение userAccountControl и что учётная запись существует." -f $sam)
+        }
+    }
+    catch {
+        Write-Log "Ошибка включения учётной записи $sam : $($_.Exception.Message)"
+        Show-Message -Text "Не удалось включить учётную запись:`n$($_.Exception.Message)" -Icon Error
     }
 }
 
@@ -2626,6 +2720,19 @@ $btnBlock.Add_Click({
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
 $btnHitHistory.Add_Click({ Invoke-ShowHitHistory })
 $btnLoadUsers.Add_Click({ Update-UsersTree })
+# Правый клик должен сначала выделить узел под курсором (иначе SelectedNode остаётся старым/пустым) -
+# стандартный приём WinForms для контекстного меню по правой кнопке в TreeView.
+$script:UsersTree.Add_NodeMouseClick({
+        param($sender, $e)
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { $script:UsersTree.SelectedNode = $e.Node }
+    })
+# Меню показывается только для пользователя (Tag задан в Update-UsersTree) - у узла OU Tag пуст, для него
+# меню просто не открывается (Cancel = $true), а не показывается с неработающим пунктом.
+$script:UsersContextMenu.Add_Opening({
+        param($sender, $e)
+        if (-not $script:UsersTree.SelectedNode -or -not $script:UsersTree.SelectedNode.Tag) { $e.Cancel = $true }
+    })
+$script:RestoreUserMenuItem.Add_Click({ Invoke-RestoreSelectedUser })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
         else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
