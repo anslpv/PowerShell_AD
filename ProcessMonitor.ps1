@@ -256,9 +256,16 @@ function Save-ScheduledComputerList {
 }
 
 # Get-ScheduledComputerList - читает сохранённый список имён компьютеров. Пустой массив, если файла нет.
+#   Каждая запись дополнительно разбивается по пробелам/запятым/точкам с запятой - защита на случай, если в
+#   списке случайно оказалась запись с НЕСКОЛЬКИМИ именами сразу (например, в поле "Добавить вручную" вставили
+#   сразу несколько имён одной строкой - см. $btnAddManual). Без этого такая запись считалась бы ОДНИМ
+#   недопустимым именем компьютера (пробел внутри не бывает в настоящих сетевых именах - см.
+#   Test-ValidComputerName) и просто пропускалась бы целиком - оба компьютера вместо опроса молча выпадали
+#   бы из планового сканирования. $raw - записи как они лежат в файле (до разбиения).
 function Get-ScheduledComputerList {
     $doc = Read-JsonFile -Path (Join-Path $script:StoreDir 'scheduled-computers.json')
-    return @(Get-JsonList -Document $doc -Key 'Computers' | ForEach-Object { [string]$_ })
+    $raw = @(Get-JsonList -Document $doc -Key 'Computers' | ForEach-Object { [string]$_ })
+    return @($raw | ForEach-Object { $_ -split '[\s,;]+' } | Where-Object { $_ })
 }
 
 # ---- Сканирования и процессы -------------------------------------------------
@@ -2808,8 +2815,17 @@ $btnLoadAd.Add_Click({ Import-AdComputers })
 $btnAll.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $true } })
 $btnNone.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $false } })
 $btnAddManual.Add_Click({
-        $n = $script:ManualBox.Text.Trim()
-        if ($n) { Add-ComputerItem -HostName $n -OS '(добавлен вручную)'; $script:ManualBox.Clear() }
+        # Разбиваем вставленный/введённый текст по пробелам/запятым/точкам с запятой - можно добавить сразу
+        # НЕСКОЛЬКО имён одной строкой (например, вставить скопированный откуда-то список), а не только одно
+        # имя за раз - без этого весь текст целиком превращался бы в ОДНО (недопустимое) имя компьютера с
+        # пробелами внутри, которое потом не опрашивалось бы вообще (см. Get-ScheduledComputerList).
+        $text = $script:ManualBox.Text.Trim()
+        if ($text) {
+            foreach ($n in ($text -split '[\s,;]+')) {
+                if ($n) { Add-ComputerItem -HostName $n -OS '(добавлен вручную)' }
+            }
+            $script:ManualBox.Clear()
+        }
     })
 $btnScan.Add_Click({ Start-Scan })
 $btnStop.Add_Click({
