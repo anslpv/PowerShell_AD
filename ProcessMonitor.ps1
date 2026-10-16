@@ -2353,7 +2353,13 @@ function Complete-BlockApply {
     foreach ($f in $result.Failures) {
         Write-Log ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
     }
-    if ($LockAccount) { Invoke-AccountLockFollowUp -Result $result -BlockLabel $BlockLabel }
+    if ($LockAccount) {
+        Invoke-AccountLockFollowUp -Result $result -BlockLabel $BlockLabel
+        # Учётная запись могла только что отключиться (Disable-AdAccount внутри Invoke-AccountLockFollowUp) -
+        # обновляем вкладку "Пользователи", ЕСЛИ её уже хоть раз открывали и загружали (Nodes.Count -gt 0):
+        # незачем самим лезть в AD, если администратор эту вкладку даже не открывал.
+        if ($script:UsersTree.Nodes.Count -gt 0) { Update-UsersTree }
+    }
     Set-Status ("Применение завершено: успешно {0}, ошибок {1}" -f $result.Succeeded, $result.Failures.Count)
     # Без этого колонки "Срабатываний"/"Последнее обнаружение"/"Последний компьютер"/"Последний пользователь"
     # на вкладке "Блокировки" не обновлялись сами - Add-BlockHit (вызванный раньше, из Invoke-BlockSweep или
