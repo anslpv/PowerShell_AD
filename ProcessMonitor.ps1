@@ -1186,6 +1186,11 @@ $script:LogFile = Join-Path $DataPath 'logs\processmonitor.log'
 #   меры: кого, когда и за что заблокировали на уровне домена. Та же ротация, что и у обычного журнала
 #   (см. Write-LogFile).
 $script:AccountBlockLogFile = Join-Path $DataPath 'logs\account-blocks.log'
+# $script:ScheduledScanLogFile - ОТДЕЛЬНЫЙ файл журнала для ПЛАНОВЫХ сканирований (data\logs\scheduled-scan.log,
+#   -ScheduledScan, запуск по расписанию без окна, см. Invoke-ScheduledScan) - чтобы отличать, что происходило
+#   именно в фоновом запуске планировщика (когда никто не смотрел в окно), от ручных запусков через интерфейс
+#   (те пишутся в основной $script:LogFile, как и раньше). Та же ротация, что и у обычного журнала.
+$script:ScheduledScanLogFile = Join-Path $DataPath 'logs\scheduled-scan.log'
 
 # Write-LogFile - дописывает сообщение в файл журнала со строкой даты и времени "гггг-мм-дд чч:мм:сс  сообщение".
 #   -Message текст; -Time время записи; -Path какой файл журнала (по умолчанию - основной, $script:LogFile;
@@ -1214,6 +1219,15 @@ function Write-LogFile {
 function Write-AccountBlockLog {
     param([string]$Message, [datetime]$Time = (Get-Date))
     Write-LogFile -Message $Message -Time $Time -Path $script:AccountBlockLogFile
+}
+
+# Write-ScheduledScanLog - дописывает строку в ОТДЕЛЬНЫЙ файл журнала плановых сканирований
+#   ($script:ScheduledScanLogFile) - тонкая обёртка над Write-LogFile с другим файлом по умолчанию, как и
+#   Write-AccountBlockLog. Используется из Invoke-ScheduledScan и из headless-ветки Invoke-BlockSweep -
+#   то есть именно там, где код выполняется в режиме -ScheduledScan (без окна, по расписанию).
+function Write-ScheduledScanLog {
+    param([string]$Message, [datetime]$Time = (Get-Date))
+    Write-LogFile -Message $Message -Time $Time -Path $script:ScheduledScanLogFile
 }
 
 # ===========================================================================
@@ -1402,39 +1416,41 @@ if ($SelfTest) {
 #   от интерактивного режима, где это делает таймер окна) и сохраняет результат как обычное сканирование.
 #   Блокировкой тут и не пахнет - это сознательно: решение заблокировать процесс должен принимать человек, глядя
 #   на таблицу, а не скрипт по расписанию. Возвращает код: 0 - сохранено хотя бы с одного компьютера, 1 - нет
-#   списка компьютеров, ни один не ответил, или сбой запуска. Пишет только в файл журнала (Write-LogFile) и в
-#   консоль - окна нет. Локальные: $names - сохранённый список; $job - фоновое задание сбора (используется и
+#   списка компьютеров, ни один не ответил, или сбой запуска. Пишет в ОТДЕЛЬНЫЙ файл журнала плановых
+#   сканирований (Write-ScheduledScanLog, data\logs\scheduled-scan.log - не основной processmonitor.log, чтобы
+#   фоновые запуски по расписанию не перемешивались в одном файле с ручными через интерфейс) и в консоль -
+#   окна нет. Локальные: $names - сохранённый список; $job - фоновое задание сбора (используется и
 #   здесь, просто с синхронным ожиданием через Wait-Job, а не таймером окна); $result - его итог
 #   (Receive-JobResults); $f - сбой одного компьютера; $scan - созданное сканирование.
 function Invoke-ScheduledScan {
     $names = @(Get-ScheduledComputerList)
     if ($names.Count -eq 0) {
         $msg = 'Плановое сканирование: список компьютеров пуст. Сохраните его на вкладке "Компьютеры" (кнопка "Сохранить список для плановых сканирований") и повторите.'
-        Write-LogFile -Message $msg
+        Write-ScheduledScanLog -Message $msg
         Write-Host $msg -ForegroundColor Yellow
         return 1
     }
-    Write-LogFile -Message "=== Плановое сканирование: старт, компьютеров $($names.Count) ==="
+    Write-ScheduledScanLog -Message "=== Плановое сканирование: старт, компьютеров $($names.Count) ==="
     try {
         $job = Start-Collection -ComputerName $names
     }
     catch {
-        Write-LogFile -Message "Плановое сканирование: не удалось запустить сбор - $($_.Exception.Message)"
+        Write-ScheduledScanLog -Message "Плановое сканирование: не удалось запустить сбор - $($_.Exception.Message)"
         return 1
     }
     $null = Wait-Job -Job $job -Timeout 3600      # запас сверх таймаутов Get-RemoteSessionOption на всякий случай
     $result = Receive-JobResults -Job $job
     foreach ($f in $result.Failures) {
-        Write-LogFile -Message ("Плановое сканирование: [{0}] нет данных: {1}" -f $f.Computer, $f.Message)
+        Write-ScheduledScanLog -Message ("Плановое сканирование: [{0}] нет данных: {1}" -f $f.Computer, $f.Message)
     }
     if ($result.Succeeded -eq 0) {
-        Write-LogFile -Message 'Плановое сканирование: ни один компьютер не ответил.'
+        Write-ScheduledScanLog -Message 'Плановое сканирование: ни один компьютер не ответил.'
         return 1
     }
     $scan = New-Scan -Requested $names.Count
     Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested $names.Count -Rows $result.Data.ToArray() `
         -Succeeded $result.Succeeded -Failed $result.Failures.Count
-    Write-LogFile -Message ("=== Плановое сканирование завершено: компьютеров {0} из {1}, записей {2} ===" -f $result.Succeeded, $names.Count, $result.Data.Count)
+    Write-ScheduledScanLog -Message ("=== Плановое сканирование завершено: компьютеров {0} из {1}, записей {2} ===" -f $result.Succeeded, $names.Count, $result.Data.Count)
     Invoke-BlockSweep -Rows $result.Data.ToArray()
     return 0
 }
@@ -1525,21 +1541,21 @@ function Invoke-BlockSweep {
         }
         catch {
             $msg = "После сканирования: не удалось запустить закрытие $label - $($_.Exception.Message)"
-            if ($ScheduledScan) { Write-LogFile -Message $msg } else { Write-Log $msg }
+            if ($ScheduledScan) { Write-ScheduledScanLog -Message $msg } else { Write-Log $msg }
             continue
         }
 
         $consequence = if ($lockAccount) { ' - закрываю, завершаю сеанс и блокирую учётную запись...' } else { ' - закрываю...' }
         $msg = "После сканирования: заблокированный файл $label обнаружен запущенным на $($map.Count) компьютер(ах)$consequence"
         if ($ScheduledScan) {
-            Write-LogFile -Message $msg
+            Write-ScheduledScanLog -Message $msg
             $null = Wait-Job -Job $job -Timeout 300
             $result = Receive-JobResults -Job $job
             foreach ($r in $result.Data) {
-                Write-LogFile -Message ("[{0}] найдено: {1}; завершено: {2}; уведомлено: {3}" -f $r.Computer, $r.Found, $r.Killed, $r.Notified)
+                Write-ScheduledScanLog -Message ("[{0}] найдено: {1}; завершено: {2}; уведомлено: {3}" -f $r.Computer, $r.Found, $r.Killed, $r.Notified)
             }
             foreach ($f in $result.Failures) {
-                Write-LogFile -Message ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
+                Write-ScheduledScanLog -Message ("[{0}] не применено: {1}" -f $f.Computer, $f.Message)
             }
             if ($lockAccount) { Invoke-AccountLockFollowUp -Result $result -BlockLabel $label }
         }
