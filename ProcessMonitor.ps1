@@ -1034,10 +1034,34 @@ function Start-RemoteCollection {
     # исключением весь обход ("недопустимо имя одного или нескольких компьютеров"), а не только эту запись -
     # см. Test-ValidComputerName. Остальные (корректные) компьютеры опрашиваются как обычно; плохие попадают
     # в Failures с понятной причиной, как и выключенные по пингу.
-    $validOnline = @($Online | Where-Object { Test-ValidComputerName -Name $_ })
-    foreach ($bad in @($Online | Where-Object { -not (Test-ValidComputerName -Name $_) })) {
-        $offlineFailures += [pscustomobject]@{ Computer = $bad; Message = 'недопустимое имя компьютера (не похоже на корректное сетевое имя) - пропущено' }
+    # Дополнительная защита: ОДНО "имя", не прошедшее проверку, может на самом деле быть НЕСКОЛЬКИМИ именами,
+    # случайно слитыми в одну запись через пробел/запятую/точку с запятой (например, старая запись в
+    # scheduled-computers.json ещё с тех пор, когда такая запись могла туда попасть) - вместо того, чтобы
+    # просто отбросить всю такую запись, пробуем разбить её тем же способом, что и Get-ScheduledComputerList,
+    # и проверить КАЖДЫЙ кусок отдельно: то, что оказалось настоящим именем компьютера, всё равно опрашивается,
+    # а не теряется молча. $pieces - кусочки непрошедшего проверку имени после разбиения.
+    $validOnline = New-Object System.Collections.ArrayList
+    foreach ($name in $Online) {
+        if (Test-ValidComputerName -Name $name) {
+            [void]$validOnline.Add($name)
+            continue
+        }
+        $pieces = @($name -split '[\s,;]+' | Where-Object { $_ })
+        if ($pieces.Count -gt 1) {
+            foreach ($piece in $pieces) {
+                if (Test-ValidComputerName -Name $piece) {
+                    [void]$validOnline.Add($piece)
+                }
+                else {
+                    $offlineFailures += [pscustomobject]@{ Computer = $piece; Message = 'недопустимое имя компьютера (не похоже на корректное сетевое имя) - пропущено' }
+                }
+            }
+        }
+        else {
+            $offlineFailures += [pscustomobject]@{ Computer = $name; Message = 'недопустимое имя компьютера (не похоже на корректное сетевое имя) - пропущено' }
+        }
     }
+    $validOnline = @($validOnline)
 
     if ($validOnline.Count -gt 0) {
         try {
