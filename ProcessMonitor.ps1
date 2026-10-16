@@ -942,6 +942,21 @@ function Get-RemoteSessionOption {
     New-PSSessionOption -OpenTimeout 20000 -OperationTimeout 900000 -NoMachineProfile
 }
 
+# Test-ValidComputerName - проверяет, похоже ли имя на корректное сетевое имя компьютера (NetBIOS/DNS),
+#   ДО обращения к WinRM. Нужна из-за особенности Invoke-Command -ComputerName: он проверяет ВЕСЬ переданный
+#   список имён СРАЗУ, одним вызовом - если хотя бы одно имя некорректно (пробелы, запрещённые символы,
+#   пустая строка - например, из кривой строки в сохранённом списке плановых сканирований), вызов целиком
+#   бросает исключение "недопустимо имя одного или нескольких компьютеров", обрывая ВЕСЬ обход, а не только
+#   этот один компьютер. Отсеивая такие имена заранее (см. Start-RemoteCollection), остальные компьютеры
+#   опрашиваются как обычно, а плохое имя просто попадает в Failures с понятной причиной.
+#   -Name имя для проверки. Правила - как у стандартных DNS/NetBIOS-имён: только буквы, цифры и дефис в
+#   пределах одной part между точками, part не начинается/не заканчивается дефисом, part непустая.
+function Test-ValidComputerName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    return [bool]($Name.Trim() -match '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$')
+}
+
 # Get-OnlineComputers - проверяет пингом (ICMP), какие из перечисленных компьютеров сейчас включены и отвечают
 #   по сети, и возвращает только их. Делается ПАРАЛЛЕЛЬНО для всех сразу через System.Net.NetworkInformation.Ping
 #   (SendPingAsync) с коротким таймаутом - иначе проверка десятков компьютеров, часть из которых выключена,
@@ -1006,10 +1021,33 @@ function Start-RemoteCollection {
             [pscustomobject]@{ Computer = $_; Message = 'не отвечает на ping (выключен или недоступен по сети)' }
         })
 
-    if ($Online.Count -gt 0) {
-        $job = Invoke-Command -ComputerName $Online -ScriptBlock $script:CollectScript `
-            -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
-            -AsJob -JobName 'ProcMon-Collect'
+    # Отсеиваем синтаксически недопустимые имена (пробелы, запрещённые символы, пустые строки и т. п.) ДО
+    # вызова Invoke-Command - у него проверка -ComputerName атомарная для ВСЕГО списка сразу: без этого шага
+    # одна плохая запись (например, кривая строка в сохранённом списке плановых сканирований) обрушила бы
+    # исключением весь обход ("недопустимо имя одного или нескольких компьютеров"), а не только эту запись -
+    # см. Test-ValidComputerName. Остальные (корректные) компьютеры опрашиваются как обычно; плохие попадают
+    # в Failures с понятной причиной, как и выключенные по пингу.
+    $validOnline = @($Online | Where-Object { Test-ValidComputerName -Name $_ })
+    foreach ($bad in @($Online | Where-Object { -not (Test-ValidComputerName -Name $_) })) {
+        $offlineFailures += [pscustomobject]@{ Computer = $bad; Message = 'недопустимое имя компьютера (не похоже на корректное сетевое имя) - пропущено' }
+    }
+
+    if ($validOnline.Count -gt 0) {
+        try {
+            $job = Invoke-Command -ComputerName $validOnline -ScriptBlock $script:CollectScript `
+                -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
+                -AsJob -JobName 'ProcMon-Collect'
+        }
+        catch {
+            # Запасной случай: Test-ValidComputerName - не точная копия правил WinRM, какое-то имя всё равно
+            # могло не пройти настоящую проверку. Не даём ОДНОЙ такой записи обрушить весь обход - отмечаем
+            # все имена из этой попытки как сбой с текстом ошибки и продолжаем (пустым заданием), а не
+            # бросаем исключение дальше.
+            foreach ($n in $validOnline) {
+                $offlineFailures += [pscustomobject]@{ Computer = $n; Message = "не удалось запустить опрос - $($_.Exception.Message)" }
+            }
+            $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
+        }
     }
     else {
         $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
