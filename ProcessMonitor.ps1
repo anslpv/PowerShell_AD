@@ -178,13 +178,28 @@ function Read-JsonFile {
 
 # Write-JsonFile - записывает данные в JSON-файл (UTF-8 без BOM) через временный файл. Создаёт папку при необходимости.
 #   -Path файл; -Data данные. $dir - папка файла; $tmp - временный файл рядом с целевым.
+#   Move-Item -Force иногда кратковременно падает с "не может создать файл, так как он уже существует" -
+#   не из-за самого кода, а из-за того, что файл в этот момент на долю секунды держит открытым другой
+#   процесс (например, антивирус сканирует файл сразу после записи, или - если плановое сканирование
+#   запускается чаще, чем успевает выполниться - предыдущий ещё не закрытый запуск того же -ScheduledScan).
+#   Поэтому перемещение повторяется несколько раз с небольшой паузой, прежде чем считать это настоящей
+#   ошибкой. $attempt - номер попытки (с 1).
 function Write-JsonFile {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Data)
     $dir = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $tmp = $Path + '.tmp'
     [System.IO.File]::WriteAllText($tmp, (ConvertTo-JsonText -Data $Data), (New-Object System.Text.UTF8Encoding($false)))
-    Move-Item -LiteralPath $tmp -Destination $Path -Force      # -Force: заменить существующий файл
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Move-Item -LiteralPath $tmp -Destination $Path -Force      # -Force: заменить существующий файл
+            return
+        }
+        catch {
+            if ($attempt -eq 5) { throw }
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
 }
 
 # Get-JsonList - достаёт из прочитанного документа список по ключу. Если документа или ключа нет - пустой массив.
