@@ -437,7 +437,8 @@ function Add-BlockRecord {
         [Parameter(Mandatory)][string]$Algorithm,
         [Parameter(Mandatory)][string]$Hash,
         [long]$Size,
-        [bool]$LockAccount = $false
+        [bool]$LockAccount = $false,
+        [string]$Group = ''
     )
     $id = 1
     foreach ($b in $script:Blocks) {
@@ -453,6 +454,7 @@ function Add-BlockRecord {
             Active      = 1
             LockAccount = [int]$LockAccount
             EventCount  = 0
+            Group       = $Group
         })
     try {
         Save-BlockLog
@@ -486,6 +488,7 @@ function Get-BlockTable {
     [void]$table.Columns.Add('LastEventTime', [string])
     [void]$table.Columns.Add('LastComputer', [string])
     [void]$table.Columns.Add('LastUser', [string])
+    [void]$table.Columns.Add('Group', [string])
     for ($i = $script:Blocks.Count - 1; $i -ge 0; $i--) {
         $b = $script:Blocks[$i]
         $status = if ([int]$b['Active'] -eq 1) { 'Активна' } else { 'Снята' }
@@ -500,11 +503,13 @@ function Get-BlockTable {
         if ($b.Contains('LastComputer')) { $lastComputer = [string]$b['LastComputer'] }
         $lastUser = ''
         if ($b.Contains('LastUser')) { $lastUser = [string]$b['LastUser'] }
+        $group = ''
+        if ($b.Contains('Group')) { $group = [string]$b['Group'] }
         $lockAccount = 'Нет'
         if ($b.Contains('LockAccount') -and [int]$b['LockAccount'] -eq 1) { $lockAccount = 'Да' }
         [void]$table.Rows.Add([int]$b['Id'], [string]$b['BlockDate'], [string]$b['Name'], [string]$b['Algorithm'],
             [string]$b['Hash'], [int]$b['Active'], $status, $lockAccount, $eventCount, $lastEventTime,
-            $lastComputer, $lastUser)
+            $lastComputer, $lastUser, $group)
     }
     return , $table
 }
@@ -1845,13 +1850,23 @@ $script:LockAccountCheck = New-Object System.Windows.Forms.CheckBox -Property @{
     Text = 'Также блокировать учётную запись пользователя при обнаружении'; AutoSize = $true
     Margin = (New-Object System.Windows.Forms.Padding(8, 10, 2, 0))
 }
+# $script:BlockGroupBox - свободное текстовое поле группы/категории (например "Игры", "Мессенджеры") -
+# читается при создании КОНКРЕТНОЙ блокировки (как и $script:LockAccountCheck), ни на что не влияет технически,
+# просто подпись для фильтрации на этой же вкладке (см. $script:BlockGroupFilterCombo).
+$script:BlockGroupBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 160; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
 $btnUnblock = New-Button 'Снять блокировку' 140
 $btnHitHistory = New-Button 'История обнаружений' 170
-$blockBar.Controls.AddRange(@($script:LockAccountCheck, $btnUnblock, $btnHitHistory))
+# $script:BlockGroupFilterCombo - DropDownStyle 'DropDown' (не 'DropDownList'!) - можно ввести любой текст
+# (фильтр по подстроке, как в $script:FilterBox на вкладке "Процессы"), а можно выбрать из уже встречавшихся
+# значений группы (список обновляется в Update-BlockGrid). Пустое значение - показать все блокировки.
+$script:BlockGroupFilterCombo = New-Object System.Windows.Forms.ComboBox -Property @{ Width = 160; DropDownStyle = 'DropDown'; Margin = (New-Object System.Windows.Forms.Padding(2, 5, 2, 0)) }
+$blockBar.Controls.AddRange(@($script:LockAccountCheck, (New-Label 'Группа:'), $script:BlockGroupBox,
+        $btnUnblock, $btnHitHistory, (New-Label 'Фильтр по группе:'), $script:BlockGroupFilterCombo))
 
-$script:BlockGrid = New-Grid
+$script:BlockGrid = New-Grid -MultiSelect
 Add-GridColumn $script:BlockGrid 'Дата' 'BlockDate' 140
 Add-GridColumn $script:BlockGrid 'Имя' 'Name' 160
+Add-GridColumn $script:BlockGrid 'Группа' 'Group' 120
 Add-GridColumn $script:BlockGrid 'Алгоритм' 'Algorithm' 70
 Add-GridColumn $script:BlockGrid 'Хэш' 'Hash' 330 -Mono
 Add-GridColumn $script:BlockGrid 'Блокировка учётной записи' 'LockAccount' 160
@@ -2311,9 +2326,45 @@ function Update-ProcessFilter {
 # Блокировка
 # ---------------------------------------------------------------------------
 
-# Update-BlockGrid - перечитывает журнал блокировок и показывает его на вкладке "Блокировки".
+# $script:BlockView - текущее представление таблицы блокировок (DataView), как $script:ProcView у вкладки
+#   "Процессы" - через него работает фильтр по группе (Update-BlockFilter).
+$script:BlockView = $null
+
+# Update-BlockGrid - перечитывает журнал блокировок, показывает его на вкладке "Блокировки" и обновляет
+#   список значений в выпадающей части $script:BlockGroupFilterCombo (все встречавшиеся непустые группы,
+#   по алфавиту, без повторов) - чтобы можно было выбрать уже использованную группу, а не вспоминать, как
+#   она называлась. Текст, который администратор уже набрал/выбрал в фильтре, не трогаем - только список
+#   вариантов под ним; сам фильтр переприменяется (Update-BlockFilter) к свежим данным.
+#   Локальные: $table - свежие данные; $groups - уникальные значения группы; $currentFilterText - то, что
+#   сейчас введено в фильтре (сохраняем на время пересборки списка).
 function Update-BlockGrid {
-    $script:BlockGrid.DataSource = (Get-BlockTable).DefaultView
+    $table = Get-BlockTable
+    $script:BlockView = $table.DefaultView
+    $script:BlockGrid.DataSource = $script:BlockView
+
+    $groups = @($table.Rows | ForEach-Object { [string]$_.Group } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    $currentFilterText = $script:BlockGroupFilterCombo.Text
+    $script:BlockGroupFilterCombo.Items.Clear()
+    [void]$script:BlockGroupFilterCombo.Items.AddRange($groups)
+    $script:BlockGroupFilterCombo.Text = $currentFilterText
+
+    Update-BlockFilter
+}
+
+# Update-BlockFilter - обработчик ввода/выбора в $script:BlockGroupFilterCombo: показывает только блокировки,
+#   у которых группа СОДЕРЖИТ введённый текст (регистр не важен, как и у поиска на вкладке "Процессы") - не
+#   точное совпадение, чтобы можно было, например, набрать "игр" и увидеть и "Игры", и "Игры (Steam)".
+#   Пустой фильтр - показать все блокировки.
+function Update-BlockFilter {
+    if (-not $script:BlockView) { return }
+    $text = $script:BlockGroupFilterCombo.Text.Trim()
+    if ($text) {
+        $like = ConvertTo-RowFilterLike -Text $text
+        $script:BlockView.RowFilter = "[Group] LIKE '%$like%'"
+    }
+    else {
+        $script:BlockView.RowFilter = ''
+    }
 }
 
 # Invoke-BlockSelected - обработчик "Заблокировать по хэшу...". Порядок действий:
@@ -2374,9 +2425,10 @@ function Invoke-BlockSelected {
     }
     if (-not (Confirm-Action -Text $message -Title 'Блокировка по хэшу')) { return }
 
+    $group = $script:BlockGroupBox.Text.Trim()
     try {
-        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LockAccount $lockAccount
-        Write-Log "Блокировка добавлена: $name ($algorithm $hash)$(if ($lockAccount) { ' [с блокировкой учётной записи]' })"
+        Add-BlockRecord -Name $name -Algorithm $algorithm -Hash $hash -Size $size -LockAccount $lockAccount -Group $group
+        Write-Log "Блокировка добавлена: $name ($algorithm $hash)$(if ($lockAccount) { ' [с блокировкой учётной записи]' })$(if ($group) { " [группа: $group]" })"
         Update-BlockGrid
     }
     catch {
@@ -2487,6 +2539,7 @@ function Invoke-BlockSelectedBatch {
 
     $algorithm = [string]$script:AlgoCombo.SelectedItem
     $lockAccount = $script:LockAccountCheck.Checked
+    $group = $script:BlockGroupBox.Text.Trim()
 
     $seen = @{}
     $toBlock = New-Object System.Collections.ArrayList
@@ -2553,8 +2606,8 @@ function Invoke-BlockSelectedBatch {
     try {
         foreach ($item in $toBlock) {
             try {
-                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LockAccount $lockAccount
-                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash))$(if ($lockAccount) { ' [с блокировкой учётной записи]' })"
+                Add-BlockRecord -Name $item.Name -Algorithm $algorithm -Hash $item.Hash -Size $item.Size -LockAccount $lockAccount -Group $group
+                Write-Log "Блокировка добавлена: $($item.Name) ($algorithm $($item.Hash))$(if ($lockAccount) { ' [с блокировкой учётной записи]' })$(if ($group) { " [группа: $group]" })"
                 $blocked++
             }
             catch {
@@ -2593,31 +2646,41 @@ function Invoke-BlockSelectedBatch {
     Set-Status "Массовая блокировка: добавлено $blocked из $($toBlock.Count)."
 }
 
-# Invoke-UnblockSelected - обработчик "Снять блокировку": помечает запись в журнале снятой. Никакой GPO больше
-#   нет, поэтому снятие блокировки - это просто Disable-BlockRecord; после снятия Invoke-BlockSweep перестаёт
-#   реагировать на этот хэш при следующих сканированиях. $row - выбранная блокировка; $text - текст подтверждения.
+# Invoke-UnblockSelected - обработчик "Снять блокировку": помечает запись(и) в журнале снятыми. Никакой GPO
+#   больше нет, поэтому снятие блокировки - это просто Disable-BlockRecord; после снятия Invoke-BlockSweep
+#   перестаёт реагировать на этот хэш при следующих сканированиях. $script:BlockGrid теперь -MultiSelect
+#   (как и $script:ProcGrid) - можно выделить несколько строк (Ctrl/Shift+клик, например, отфильтровав по
+#   группе) и снять их одним нажатием; уже снятые среди выделенных просто пропускаются, а не прерывают
+#   обработку остальных. Локальные: $rows - выделенные строки (активные среди них); $text - подтверждение;
+#   $removed - сколько реально снято; $row - текущая строка в цикле.
 function Invoke-UnblockSelected {
-    if (-not $script:BlockGrid.CurrentRow -or -not $script:BlockGrid.CurrentRow.DataBoundItem) {
-        Show-Message -Text 'Выберите блокировку в таблице.' -Icon Warning
+    $rows = @($script:BlockGrid.SelectedRows | ForEach-Object { $_.DataBoundItem.Row } | Where-Object { [int]$_['Active'] -eq 1 })
+    if ($rows.Count -eq 0) {
+        Show-Message -Text 'Выберите в таблице хотя бы одну ДЕЙСТВУЮЩУЮ блокировку (уже снятые пропускаются).' -Icon Warning
         return
     }
-    $row = $script:BlockGrid.CurrentRow.DataBoundItem.Row
-    if ([int]$row['Active'] -ne 1) {
-        Show-Message -Text 'Эта блокировка уже снята.'
-        return
+    $text = if ($rows.Count -eq 1) {
+        "Снять блокировку?`n`nИмя: $($rows[0]['Name'])`n$($rows[0]['Algorithm']): $($rows[0]['Hash'])`nБлокировка учётной записи: $($rows[0]['LockAccount'])"
     }
-    $text = "Снять блокировку?`n`nИмя: $($row['Name'])`n$($row['Algorithm']): $($row['Hash'])`nБлокировка учётной записи: $($row['LockAccount'])"
+    else {
+        "Снять $($rows.Count) блокировок?`n`n" + (($rows | ForEach-Object { "  - $($_['Name'])" }) -join "`n")
+    }
     if (-not (Confirm-Action -Text $text -Title 'Снятие блокировки')) { return }
 
-    try {
-        Disable-BlockRecord -Id ([int]$row['Id'])
-        Write-Log "Блокировка снята: $($row['Name']) ($($row['Algorithm']) $($row['Hash']))"
-        Update-BlockGrid
+    $removed = 0
+    foreach ($row in $rows) {
+        try {
+            Disable-BlockRecord -Id ([int]$row['Id'])
+            Write-Log "Блокировка снята: $($row['Name']) ($($row['Algorithm']) $($row['Hash']))"
+            $removed++
+        }
+        catch {
+            Write-Log "Ошибка снятия блокировки $($row['Name']): $($_.Exception.Message)"
+            Show-Message -Text "Не удалось снять блокировку $($row['Name']):`n$($_.Exception.Message)" -Icon Error
+        }
     }
-    catch {
-        Write-Log "Ошибка снятия блокировки: $($_.Exception.Message)"
-        Show-Message -Text "Не удалось снять блокировку:`n$($_.Exception.Message)" -Icon Error
-    }
+    Update-BlockGrid
+    if ($rows.Count -gt 1) { Set-Status "Снято блокировок: $removed из $($rows.Count)" }
 }
 
 # Invoke-ShowHitHistory - обработчик "История обнаружений": отдельное окно со всеми отдельными случаями
@@ -2720,6 +2783,8 @@ $btnBlock.Add_Click({
         else { Invoke-BlockSelected }
     })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
+$script:BlockGroupFilterCombo.Add_TextChanged({ Update-BlockFilter })
+$script:BlockGroupFilterCombo.Add_SelectedIndexChanged({ Update-BlockFilter })
 $btnHitHistory.Add_Click({ Invoke-ShowHitHistory })
 $btnLoadUsers.Add_Click({ Update-UsersTree })
 # Правый клик должен сначала выделить узел под курсором (иначе SelectedNode остаётся старым/пустым) -
