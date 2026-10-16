@@ -256,9 +256,9 @@ function Save-ScheduledComputerList {
 }
 
 # Get-ScheduledComputerList - читает сохранённый список имён компьютеров. Пустой массив, если файла нет.
-#   Каждая запись дополнительно разбивается по пробелам/запятым/точкам с запятой - защита на случай, если в
-#   списке случайно оказалась запись с НЕСКОЛЬКИМИ именами сразу (например, в поле "Добавить вручную" вставили
-#   сразу несколько имён одной строкой - см. $btnAddManual). Без этого такая запись считалась бы ОДНИМ
+#   Каждая запись дополнительно разбивается по пробелам/запятым/точкам с запятой - самостоятельно лечит уже
+#   сохранённые в файле записи, где случайно оказалось сразу НЕСКОЛЬКО имён в одной строке (например, из версии
+#   приложения, где ещё было поле ручного добавления компьютера). Без этого такая запись считалась бы ОДНИМ
 #   недопустимым именем компьютера (пробел внутри не бывает в настоящих сетевых именах - см.
 #   Test-ValidComputerName) и просто пропускалась бы целиком - оба компьютера вместо опроса молча выпадали
 #   бы из планового сканирования. $raw - записи как они лежат в файле (до разбиения).
@@ -1858,7 +1858,6 @@ function Set-Status {
 #   $compBar - панель инструментов вкладки;
 #   $btnLoadAd - "Загрузить из AD"; $btnAll / $btnNone - отметить все / снять отметки;
 #   $script:SearchBaseBox - поле DN подразделения (OU) для поиска в AD (пусто - весь домен);
-#   $script:ManualBox + $btnAddManual - поле и кнопка ручного добавления компьютера;
 #   $btnScan - "Собрать процессы"; $btnStop - "Остановить" сбор (активна только во время сбора);
 #   $btnSaveSchedule - сохраняет отмеченные компьютеры как список для плановых сканирований
 #   (см. -ScheduledScan в справке скрипта и README - запуск по расписанию без окна);
@@ -1869,15 +1868,13 @@ $btnLoadAd = New-Button 'Загрузить из AD' 140
 $btnAll = New-Button 'Выбрать все' 100
 $btnNone = New-Button 'Снять выбор' 100
 $script:SearchBaseBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 300; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
-$script:ManualBox = New-Object System.Windows.Forms.TextBox -Property @{ Width = 160; Margin = (New-Object System.Windows.Forms.Padding(2, 7, 2, 0)) }
-$btnAddManual = New-Button 'Добавить' 80
 $btnScan = New-Button 'Собрать процессы' 150
 $btnStop = New-Button 'Остановить' 100
 $btnStop.Enabled = $false
 $btnSaveSchedule = New-Button 'Сохранить список для плановых сканирований' 260
 $btnLoadSchedule = New-Button 'Загрузить сохранённый список' 190
 $compBar.Controls.AddRange(@($btnLoadAd, (New-Label 'OU (DN, необязательно):'), $script:SearchBaseBox,
-        $btnAll, $btnNone, (New-Label 'Добавить вручную:'), $script:ManualBox, $btnAddManual, $btnScan, $btnStop,
+        $btnAll, $btnNone, $btnScan, $btnStop,
         $btnSaveSchedule, $btnLoadSchedule))
 
 $script:CompList = New-Object System.Windows.Forms.ListView
@@ -2807,26 +2804,13 @@ function Invoke-ShowHitHistory {
 # Обработчики событий
 # ---------------------------------------------------------------------------
 
-# Связь кнопок и действий. $i - элемент списка компьютеров; $n - имя, введённое для ручного добавления.
+# Связь кнопок и действий. $i - элемент списка компьютеров.
 #   "Остановить" останавливает $script:ScanJob; смена сканирования/алгоритма перезагружает таблицу;
 #   ввод в поле поиска фильтрует таблицу; при закрытии окна таймер и все фоновые задания останавливаются;
 #   при показе окна загружаются сканирования и блокировки, а в журнал пишется путь к папке данных.
 $btnLoadAd.Add_Click({ Import-AdComputers })
 $btnAll.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $true } })
 $btnNone.Add_Click({ foreach ($i in $script:CompList.Items) { $i.Checked = $false } })
-$btnAddManual.Add_Click({
-        # Разбиваем вставленный/введённый текст по пробелам/запятым/точкам с запятой - можно добавить сразу
-        # НЕСКОЛЬКО имён одной строкой (например, вставить скопированный откуда-то список), а не только одно
-        # имя за раз - без этого весь текст целиком превращался бы в ОДНО (недопустимое) имя компьютера с
-        # пробелами внутри, которое потом не опрашивалось бы вообще (см. Get-ScheduledComputerList).
-        $text = $script:ManualBox.Text.Trim()
-        if ($text) {
-            foreach ($n in ($text -split '[\s,;]+')) {
-                if ($n) { Add-ComputerItem -HostName $n -OS '(добавлен вручную)' }
-            }
-            $script:ManualBox.Clear()
-        }
-    })
 $btnScan.Add_Click({ Start-Scan })
 $btnStop.Add_Click({
         if ($script:ScanJob) {
