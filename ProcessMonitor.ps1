@@ -1729,7 +1729,9 @@ $tabLog.Controls.Add($logBar)
 function Write-Log {
     param([string]$Message)
     $now = Get-Date
-    if ($script:LogBox) { $script:LogBox.AppendText(('{0}  {1}{2}' -f $now.ToString('HH:mm:ss'), $Message, [Environment]::NewLine)) }
+    # Дата, а не только время - иначе при долгой работе (особенно после полуночи) или сверке с файлом
+    # журнала/историей при запуске (Import-LogHistory, там дата есть) непонятно, к какому дню относится запись.
+    if ($script:LogBox) { $script:LogBox.AppendText(('{0}  {1}{2}' -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $Message, [Environment]::NewLine)) }
     Write-LogFile -Message $Message -Time $now
 }
 
