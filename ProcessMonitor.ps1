@@ -112,15 +112,30 @@ function ConvertTo-JsonText {
     return (ConvertTo-Json -InputObject $Data -Depth 10 -Compress)
 }
 
-# ConvertTo-PlainData - превращает результат ConvertFrom-Json (PSCustomObject и массивы) в хэш-таблицы и ArrayList,
-#   чтобы работал доступ $d['Ключ']. Нужна только в запасном варианте чтения на PowerShell 5.1 без JavaScriptSerializer.
-#   -Value результат ConvertFrom-Json. $d - собираемая хэш-таблица; $prop - свойство объекта; $list / $i - список и его элемент.
+# ConvertTo-PlainData - приводит результат разбора JSON (ЛЮБОГО из серилизаторов ниже) к хэш-таблицам
+#   (Hashtable) и ArrayList, чтобы везде в коде можно было писать $d['Ключ'] и $d.Contains('Ключ')/
+#   .ContainsKey('Ключ') одинаково, независимо от того, КАКИМ серилизатором запись была прочитана.
+#   Это важно: JavaScriptSerializer.DeserializeObject (основной путь на настоящем Windows PowerShell 5.1,
+#   где есть System.Web.Extensions) возвращает для JSON-объекта не Hashtable, а
+#   System.Collections.Generic.Dictionary[string,object] - у него есть .ContainsKey(), но ВЫЗОВ .Contains()
+#   с одной строкой не находит подходящей перегрузки (есть только версия для KeyValuePair) и бросает
+#   "Cannot find an overload for "Contains" and the argument count: 1" - ровно это и ловит .Contains() в
+#   остальном коде (намеренно универсальный для [ordered]@{} и Hashtable - см. комментарии у Get-BlockTable).
+#   Без этой нормализации код работал бы только там, где JavaScriptSerializer недоступен (например, не на
+#   настоящем Windows PowerShell, а в PowerShell 7/Linux - именно поэтому проблема не поймалась раньше).
+#   -Value результат разбора JSON. $d - собираемая хэш-таблица; $prop - свойство PSCustomObject;
+#   $key - ключ словаря; $list / $i - список и его элемент.
 function ConvertTo-PlainData {
     param($Value)
     if ($null -eq $Value) { return $null }
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
         $d = @{}
         foreach ($prop in $Value.PSObject.Properties) { $d[$prop.Name] = ConvertTo-PlainData -Value $prop.Value }
+        return $d
+    }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $d = @{}
+        foreach ($key in @($Value.Keys)) { $d[$key] = ConvertTo-PlainData -Value $Value[$key] }
         return $d
     }
     if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
@@ -132,13 +147,14 @@ function ConvertTo-PlainData {
 }
 
 # ConvertFrom-JsonText - превращает текст JSON в словари и массивы (объект JSON -> словарь, доступ $d['Ключ']).
-#   Сначала пробует быстрый JavaScriptSerializer.DeserializeObject (чистые .NET-типы); если его нет или он сбойнул -
-#   ConvertFrom-Json (на PowerShell 6+ с -AsHashtable, на 5.1 с преобразованием через ConvertTo-PlainData).
+#   Сначала пробует быстрый JavaScriptSerializer.DeserializeObject; если его нет или он сбойнул - ConvertFrom-Json
+#   (на PowerShell 6+ с -AsHashtable). Результат ЛЮБОГО из путей проходит через ConvertTo-PlainData - без этого
+#   JavaScriptSerializer отдавал бы Dictionary[string,object] вместо Hashtable (см. её комментарий).
 #   -Text строка с JSON.
 function ConvertFrom-JsonText {
     param([Parameter(Mandatory)][string]$Text)
     if ($script:JsonSerializer) {
-        try { return $script:JsonSerializer.DeserializeObject($Text) }
+        try { return (ConvertTo-PlainData -Value $script:JsonSerializer.DeserializeObject($Text)) }
         catch { }       # переходим к запасному варианту ниже
     }
     if ($PSVersionTable.PSVersion.Major -ge 6) { return (ConvertFrom-Json -InputObject $Text -AsHashtable) }
