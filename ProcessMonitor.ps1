@@ -1039,14 +1039,44 @@ function Start-RemoteCollection {
                 -AsJob -JobName 'ProcMon-Collect'
         }
         catch {
-            # Запасной случай: Test-ValidComputerName - не точная копия правил WinRM, какое-то имя всё равно
-            # могло не пройти настоящую проверку. Не даём ОДНОЙ такой записи обрушить весь обход - отмечаем
-            # все имена из этой попытки как сбой с текстом ошибки и продолжаем (пустым заданием), а не
-            # бросаем исключение дальше.
+            # Синтаксически корректное имя (прошло Test-ValidComputerName) всё равно может не РЕЗОЛВИТЬСЯ
+            # именно в момент обращения WinRM - например, DNS-запись протухла/изменилась уже ПОСЛЕ того, как
+            # этот же компьютер ответил на пинг (Get-OnlineComputers) чуть раньше. Invoke-Command -ComputerName
+            # проверяет весь список сразу - и в этом случае тоже бросает исключение на ВЕСЬ вызов, а не только
+            # на нерезолвящееся имя (ровно так же, как было с синтаксически недопустимыми именами выше).
+            # Поэтому: проверяем КАЖДОЕ имя из этой попытки через реальное разрешение DNS прямо сейчас
+            # ([System.Net.Dns]::GetHostEntry) - то, что не резолвится, в Failures с понятной причиной и
+            # именем, а для остальных (которые всё ещё резолвятся) делаем ОДНУ повторную попытку без них, не
+            # обрушивая весь обход из-за одного-двух "протухших" имён.
+            $resolved = New-Object System.Collections.ArrayList
             foreach ($n in $validOnline) {
-                $offlineFailures += [pscustomobject]@{ Computer = $n; Message = "не удалось запустить опрос - $($_.Exception.Message)" }
+                try {
+                    [void][System.Net.Dns]::GetHostEntry($n)
+                    [void]$resolved.Add($n)
+                }
+                catch {
+                    $offlineFailures += [pscustomobject]@{ Computer = $n; Message = "не распознаётся сетевое имя (DNS не может разрешить - устаревшая запись или временный сбой) - $($_.Exception.Message)" }
+                }
             }
-            $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
+            if ($resolved.Count -gt 0) {
+                try {
+                    $job = Invoke-Command -ComputerName @($resolved) -ScriptBlock $script:CollectScript `
+                        -SessionOption (Get-RemoteSessionOption) -ThrottleLimit $ThrottleLimit `
+                        -AsJob -JobName 'ProcMon-Collect'
+                }
+                catch {
+                    # И после отсева нерезолвящихся имён вызов всё равно не удался (значит, причина другая,
+                    # не DNS - например, нет прав или WinRM не настроен сразу на нескольких из оставшихся) -
+                    # не даём и этому обрушить весь обход: отмечаем сбоем и продолжаем пустым заданием.
+                    foreach ($n in @($resolved)) {
+                        $offlineFailures += [pscustomobject]@{ Computer = $n; Message = "не удалось запустить опрос - $($_.Exception.Message)" }
+                    }
+                    $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
+                }
+            }
+            else {
+                $job = Start-Job -Name 'ProcMon-Collect' -ScriptBlock { }
+            }
         }
     }
     else {
