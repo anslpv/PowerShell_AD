@@ -632,6 +632,49 @@ function Get-AdComputers {
     }
 }
 
+# Get-AdUsersWithOuStatus - читает из AD ВСЕХ пользователей домена (запрос LDAP через ADSI, как и
+#   Get-AdComputers) вместе с их подразделением (OU) и статусом учётной записи (включена/отключена) - для
+#   вкладки "Пользователи". Возвращает объекты { Name, Sam, Disabled, OuPath, Dn }: OuPath - массив названий
+#   OU от КОРНЯ к листу (ближе к пользователю), разобранный из distinguishedName - используется для построения
+#   дерева (Update-UsersTree). Пользователи не в подразделении (например, встроенный контейнер CN=Users) -
+#   OuPath = @('(без OU)').
+#   Локальные: $searcher/$results - поиск; $r - текущая запись; $dn - её distinguishedName;
+#   $comps - части DN, разбитые по запятой; $ouParts - только части, начинающиеся с "OU=" (без этого префикса).
+function Get-AdUsersWithOuStatus {
+    $searcher = New-Object System.DirectoryServices.DirectorySearcher
+    $searcher.Filter = '(&(objectCategory=person)(objectClass=user))'
+    $searcher.PageSize = 1000
+    foreach ($prop in 'distinguishedname', 'samaccountname', 'name', 'useraccountcontrol') {
+        [void]$searcher.PropertiesToLoad.Add($prop)
+    }
+
+    $results = $searcher.FindAll()
+    try {
+        foreach ($r in $results) {
+            if (-not $r.Properties['distinguishedname'].Count) { continue }
+            $dn = [string]$r.Properties['distinguishedname'][0]
+            $sam = if ($r.Properties['samaccountname'].Count) { [string]$r.Properties['samaccountname'][0] } else { '' }
+            $name = if ($r.Properties['name'].Count) { [string]$r.Properties['name'][0] } else { $sam }
+            $uac = if ($r.Properties['useraccountcontrol'].Count) { [int]$r.Properties['useraccountcontrol'][0] } else { 0 }
+            $disabled = (($uac -band 0x2) -ne 0)
+
+            # DN вида "CN=Иванов Иван,OU=Продажи,OU=Сотрудники,DC=pp,DC=local" - части "OU=..." идут от самого
+            # БЛИЗКОГО к пользователю подразделения к самому дальнему, поэтому порядок разворачивается, чтобы
+            # получить путь от корня (как ожидает Update-UsersTree при построении дерева).
+            $comps = $dn -split ','
+            $ouParts = @($comps | Where-Object { $_ -match '^OU=' } | ForEach-Object { ($_ -replace '^OU=', '').Trim() })
+            [array]::Reverse($ouParts)
+            if ($ouParts.Count -eq 0) { $ouParts = @('(без OU)') }
+
+            [pscustomobject]@{ Name = $name; Sam = $sam; Disabled = $disabled; OuPath = $ouParts; Dn = $dn }
+        }
+    }
+    finally {
+        $results.Dispose()
+        $searcher.Dispose()
+    }
+}
+
 # Disable-AdAccount - ПОЛНОСТЬЮ отключает учётную запись пользователя в AD (бит ACCOUNTDISABLE = 0x2 в атрибуте
 #   userAccountControl) - человек не сможет войти вообще никуда в домене (ни на один компьютер, почту и т. п.),
 #   пока администратор не включит учётную запись обратно вручную. Используется для блокировок с LockAccount=1
@@ -1636,8 +1679,9 @@ $tabs.Dock = 'Fill'
 $tabComputers = New-Object System.Windows.Forms.TabPage -Property @{ Text = 'Компьютеры' }
 $tabProcesses = New-Object System.Windows.Forms.TabPage -Property @{ Text = 'Процессы' }
 $tabBlocks = New-Object System.Windows.Forms.TabPage -Property @{ Text = 'Блокировки' }
+$tabUsers = New-Object System.Windows.Forms.TabPage -Property @{ Text = 'Пользователи' }
 $tabLog = New-Object System.Windows.Forms.TabPage -Property @{ Text = 'Журнал' }
-$tabs.TabPages.AddRange(@($tabComputers, $tabProcesses, $tabBlocks, $tabLog))
+$tabs.TabPages.AddRange(@($tabComputers, $tabProcesses, $tabBlocks, $tabUsers, $tabLog))
 
 # --- Строка состояния ------------------------------------------------------
 # Строка состояния внизу окна:
@@ -1801,6 +1845,24 @@ Add-GridColumn $script:BlockGrid 'Статус' 'Status' 100 -Fill
 $tabBlocks.Controls.Add($script:BlockGrid)
 $tabBlocks.Controls.Add($blockBar)
 
+# --- Вкладка "Пользователи" -------------------------------------------------
+# Вкладка "Пользователи": все пользователи домена деревом по подразделениям (OU) - показывает, у кого
+# учётная запись отключена (красным) или активна (зелёным); не связана напрямую с блокировками по хэшу - это
+# просто общий обзор состояния учётных записей в AD (в т. ч. удобно проверить результат блокировки учётной
+# записи, см. "Блокировка учётной записи" в README.md, без необходимости открывать ADUC).
+#   $usersBar - панель инструментов; $btnLoadUsers - "Загрузить из AD"; $script:UsersTree - само дерево.
+$usersBar = New-Toolbar
+$btnLoadUsers = New-Button 'Загрузить из AD' 140
+$usersLegend = New-Label 'Красным - учётная запись отключена; зелёным - активна'
+$usersBar.Controls.AddRange(@($btnLoadUsers, $usersLegend))
+
+$script:UsersTree = New-Object System.Windows.Forms.TreeView
+$script:UsersTree.Dock = 'Fill'
+$script:UsersTree.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+$tabUsers.Controls.Add($script:UsersTree)
+$tabUsers.Controls.Add($usersBar)
+
 $script:Form.Controls.Add($tabs)
 $script:Form.Controls.Add($status)
 
@@ -1898,6 +1960,63 @@ function Import-AdComputers {
         Write-Log "Ошибка запроса к AD: $($_.Exception.Message)"
         Show-Message -Text "Не удалось получить список из AD:`n$($_.Exception.Message)" -Icon Error
         Set-Status 'Ошибка запроса к AD'
+    }
+    finally {
+        $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+}
+
+# Update-UsersTree - обработчик "Загрузить из AD" на вкладке "Пользователи": запрашивает всех пользователей
+#   (Get-AdUsersWithOuStatus) и строит дерево по подразделениям - узлы верхнего уровня и дальше вглубь - это
+#   сами OU, листья - пользователи, подписанные "Имя (логин)" и подсвеченные цветом по статусу учётной записи.
+#   Повторный вызов полностью пересобирает дерево (Nodes.Clear()), поэтому безопасно нажимать ещё раз, чтобы
+#   увидеть текущее состояние.
+#   Локальные: $users - все пользователи с их OU и статусом; $nodeMap - уже созданные узлы OU по полному пути
+#   (чтобы не создавать один и тот же узел повторно для разных пользователей из одной OU); $parent - коллекция
+#   узлов, в которую сейчас добавляем (меняется на дочернюю на каждом шаге вглубь по OuPath); $path - путь к
+#   текущему уровню OU (накопительно, через "\", ключ для $nodeMap); $ouNode/$leaf - создаваемые узлы;
+#   $disabledCount - сколько отключённых учётных записей найдено (для строки состояния).
+function Update-UsersTree {
+    $script:Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    Set-Status 'Запрос пользователей из AD...'
+    $script:UsersTree.Nodes.Clear()
+    try {
+        $users = @(Get-AdUsersWithOuStatus | Sort-Object { $_.OuPath -join '\' }, Name)
+        $nodeMap = @{}
+        $disabledCount = 0
+        foreach ($u in $users) {
+            $path = ''
+            $parent = $script:UsersTree.Nodes
+            foreach ($seg in $u.OuPath) {
+                $path = if ($path) { "$path\$seg" } else { $seg }
+                if ($nodeMap.ContainsKey($path)) {
+                    $ouNode = $nodeMap[$path]
+                }
+                else {
+                    $ouNode = New-Object System.Windows.Forms.TreeNode($seg)
+                    $nodeMap[$path] = $ouNode
+                    [void]$parent.Add($ouNode)
+                }
+                $parent = $ouNode.Nodes
+            }
+            $leaf = New-Object System.Windows.Forms.TreeNode("$($u.Name) ($($u.Sam))")
+            if ($u.Disabled) {
+                $leaf.BackColor = [System.Drawing.Color]::FromArgb(255, 205, 205)
+                $disabledCount++
+            }
+            else {
+                $leaf.BackColor = [System.Drawing.Color]::FromArgb(205, 255, 205)
+            }
+            $leaf.ForeColor = [System.Drawing.Color]::Black
+            [void]$parent.Add($leaf)
+        }
+        Write-Log "Пользователи AD загружены: всего $($users.Count), отключено $disabledCount"
+        Set-Status "Пользователей: $($users.Count), отключено: $disabledCount"
+    }
+    catch {
+        Write-Log "Ошибка запроса пользователей из AD: $($_.Exception.Message)"
+        Show-Message -Text "Не удалось получить список пользователей:`n$($_.Exception.Message)" -Icon Error
+        Set-Status 'Ошибка запроса пользователей из AD'
     }
     finally {
         $script:Form.Cursor = [System.Windows.Forms.Cursors]::Default
@@ -2236,6 +2355,12 @@ function Complete-BlockApply {
     }
     if ($LockAccount) { Invoke-AccountLockFollowUp -Result $result -BlockLabel $BlockLabel }
     Set-Status ("Применение завершено: успешно {0}, ошибок {1}" -f $result.Succeeded, $result.Failures.Count)
+    # Без этого колонки "Срабатываний"/"Последнее обнаружение"/"Последний компьютер"/"Последний пользователь"
+    # на вкладке "Блокировки" не обновлялись сами - Add-BlockHit (вызванный раньше, из Invoke-BlockSweep или
+    # Invoke-BlockSelected(Batch), ДО старта этого фонового задания) уже всё посчитал и сохранил на диск, но
+    # $script:BlockGrid показывает снимок DataTable на момент последнего Update-BlockGrid, а не живые данные -
+    # сама таблица не перерисовывается заново при изменении $script:Blocks в памяти.
+    Update-BlockGrid
 }
 
 # Invoke-BlockSelectedBatch - обработчик "Заблокировать по хэшу..." при выделении НЕСКОЛЬКИХ строк: для каждого
@@ -2494,6 +2619,7 @@ $btnBlock.Add_Click({
     })
 $btnUnblock.Add_Click({ Invoke-UnblockSelected })
 $btnHitHistory.Add_Click({ Invoke-ShowHitHistory })
+$btnLoadUsers.Add_Click({ Update-UsersTree })
 $btnOpenLog.Add_Click({
         if (Test-Path -LiteralPath $script:LogFile) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $script:LogFile) }
         else { Show-Message -Text ('Файл журнала ещё не создан: ' + $script:LogFile) }
