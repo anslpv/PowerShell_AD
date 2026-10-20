@@ -1305,6 +1305,13 @@ $script:AccountBlockLogFile = Join-Path $DataPath 'logs\account-blocks.log'
 #   именно в фоновом запуске планировщика (когда никто не смотрел в окно), от ручных запусков через интерфейс
 #   (те пишутся в основной $script:LogFile, как и раньше). Та же ротация, что и у обычного журнала.
 $script:ScheduledScanLogFile = Join-Path $DataPath 'logs\scheduled-scan.log'
+# $script:ScheduledProcessLogFile - ОТДЕЛЬНЫЙ файл журнала (data\logs\scheduled-processes.log) со списком
+#   КАЖДОГО процесса, найденного во время планового сканирования (компьютер, пользователь, имя, путь, когда
+#   запущен) - обычный текст, который можно открыть и просмотреть без запуска приложения (например, прямо на
+#   сервере, где настроен планировщик), не открывая JSON и не дожидаясь, пока кто-то откроет вкладку
+#   "Процессы". scheduled-scan.log по-прежнему хранит только сводку/ошибки по каждому сканированию - этот
+#   файл дополняет его построчной распечаткой самих находок. Та же ротация, что и у обычного журнала.
+$script:ScheduledProcessLogFile = Join-Path $DataPath 'logs\scheduled-processes.log'
 
 # Write-LogFile - дописывает сообщение в файл журнала со строкой даты и времени "гггг-мм-дд чч:мм:сс  сообщение".
 #   -Message текст; -Time время записи; -Path какой файл журнала (по умолчанию - основной, $script:LogFile;
@@ -1342,6 +1349,14 @@ function Write-AccountBlockLog {
 function Write-ScheduledScanLog {
     param([string]$Message, [datetime]$Time = (Get-Date))
     Write-LogFile -Message $Message -Time $Time -Path $script:ScheduledScanLogFile
+}
+
+# Write-ScheduledProcessLog - дописывает строку в ОТДЕЛЬНЫЙ файл журнала найденных процессов планового
+#   сканирования ($script:ScheduledProcessLogFile) - тонкая обёртка над Write-LogFile, как и
+#   Write-ScheduledScanLog.
+function Write-ScheduledProcessLog {
+    param([string]$Message, [datetime]$Time = (Get-Date))
+    Write-LogFile -Message $Message -Time $Time -Path $script:ScheduledProcessLogFile
 }
 
 # ===========================================================================
@@ -1564,6 +1579,15 @@ function Invoke-ScheduledScan {
     $scan = New-Scan -Requested $names.Count
     Save-Processes -ScanId $scan.Id -ScanDate $scan.Date -Requested $names.Count -Rows $result.Data.ToArray() `
         -Succeeded $result.Succeeded -Failed $result.Failures.Count
+    # Построчно в отдельный журнал находок (помимо самого JSON-сканирования, см. комментарий
+    # $script:ScheduledProcessLogFile) - по одной строке на каждый найденный процесс: компьютер, пользователь,
+    # имя файла, путь и когда он был запущен (StartTime может быть пустым, если WMI его не отдал - см.
+    # $script:CollectScript).
+    foreach ($row in $result.Data) {
+        Write-ScheduledProcessLog -Message ("[{0}] {1} - {2} ({3}){4}" -f $row.Computer, $row.Name, $row.Path,
+            $(if ($row.User) { $row.User } else { '(владелец не определён)' }),
+            $(if ($row.StartTime) { ', запущен ' + $row.StartTime } else { '' }))
+    }
     Write-ScheduledScanLog -Message ("=== Плановое сканирование завершено: компьютеров {0} из {1}, записей {2} ===" -f $result.Succeeded, $names.Count, $result.Data.Count)
     Invoke-BlockSweep -Rows $result.Data.ToArray()
     return 0
